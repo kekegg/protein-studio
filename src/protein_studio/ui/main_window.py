@@ -1,0 +1,332 @@
+"""Main application window — Blender-like layout.
+
+Layout
+------
+
+    ┌─ Menu bar ────────────────────────────────────────────┐
+    ├─ Toolbar (Open, Save, Snapshot, Refresh, …) ──────────┤
+    ├────────────┬───────────────────────────┬──────────────┤
+    │  Outliner  │       3D Viewport         │  Properties  │
+    │            │                           │              │
+    ├────────────┴───────────────────────────┴──────────────┤
+    │  Python console (collapsible)                          │
+    └────────────────────────────────────────────────────────┘
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Optional
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QAction, QKeySequence, QIcon
+from PySide6.QtWidgets import (
+    QMainWindow, QFileDialog, QMessageBox, QSplitter, QWidget, QVBoxLayout,
+    QToolBar, QStatusBar, QLabel, QDockWidget, QApplication, QPushButton,
+    QHBoxLayout, QToolButton,
+)
+
+from ..api import StudioAPI
+from ..core.io import load_pdb, save_pdb
+from ..core.scene import Scene
+from .console import PythonConsole
+from .outliner import OutlinerWidget
+from .properties import PropertiesWidget
+from .viewport import ViewportWidget
+
+
+APP_NAME = "Protein Studio"
+APP_VERSION = "0.1.0"
+
+
+class MainWindow(QMainWindow):
+    """The main window."""
+
+    def __init__(self, scene: Scene, viewport: ViewportWidget,
+                 outliner: OutlinerWidget, properties: PropertiesWidget,
+                 console: PythonConsole, api: StudioAPI,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.scene = scene
+        self.viewport = viewport
+        self.outliner = outliner
+        self.properties = properties
+        self.console = console
+        self.api = api
+
+        self.setWindowTitle(APP_NAME)
+        self.resize(1280, 800)
+        self.setStyleSheet(
+            "QMainWindow { background: #2d2d2d; }"
+            "QMenuBar { background: #2d2d2d; color: #dcdcdc; }"
+            "QMenuBar::item:selected { background: #3a3a3a; }"
+            "QMenu { background: #2d2d2d; color: #dcdcdc; border: 1px solid #1a1a1a; }"
+            "QMenu::item:selected { background: #3b76c2; }"
+            "QStatusBar { background: #1d1d1d; color: #888; }"
+            "QToolBar { background: #2d2d2d; border-bottom: 1px solid #1a1a1a; spacing: 4px; }"
+        )
+
+        self._build_menus()
+        self._build_toolbar()
+        self._build_central()
+
+        # Status bar
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+        self._status_label = QLabel("Ready")
+        self.status.addWidget(self._status_label)
+
+        # Wire events
+        self.properties.object_modified.connect(self._on_object_modified)
+        self.scene.on_change(self._on_scene_change)
+
+    # --------------------------------------------------------------- ui build
+    def _build_menus(self) -> None:
+        menubar = self.menuBar()
+        # File
+        m_file = menubar.addMenu("&File")
+        m_file.addAction(self._mk_action("Open PDB…", "Ctrl+O", self.open_pdb_dialog))
+        m_file.addAction(self._mk_action("Open Docking…", "Ctrl+D", self.open_docking_dialog))
+        m_file.addAction(self._mk_action("Open Trajectory…", "Ctrl+T", self.open_trajectory_dialog))
+        m_file.addAction(self._mk_action("Open AlphaFold…", "Ctrl+Shift+A", self.open_alphafold_dialog))
+        m_file.addAction(self._mk_action("Save PDB…", "Ctrl+S", self.save_pdb_dialog))
+        m_file.addSeparator()
+        m_file.addAction(self._mk_action("Snapshot…", "F12", self.take_snapshot))
+        m_file.addSeparator()
+        m_file.addAction(self._mk_action("Quit", "Ctrl+Q", self.close))
+
+        # Edit
+        m_edit = menubar.addMenu("&Edit")
+        m_edit.addAction(self._mk_action("Clear Scene", "Ctrl+Shift+C", self.clear_scene))
+        m_edit.addAction(self._mk_action("Center View",  "Numpad .",       self.center_view))
+
+        # View
+        m_view = menubar.addMenu("&View")
+        m_view.addAction(self._mk_action("Fit Camera", "Home", self.viewport.fit_view))
+        m_view.addAction(self._mk_action("Toggle Axes", None,   self.viewport.toggle_axes))
+
+        # Render
+        m_render = menubar.addMenu("&Render")
+        m_render.addAction(self._mk_action("Refresh", "F5", self.refresh_viewport))
+        m_render.addAction(self._mk_action("Toggle Wireframe", "Z", self.toggle_wireframe))
+
+        # Help
+        m_help = menubar.addMenu("&Help")
+        m_help.addAction(self._mk_action("About", None, self.show_about))
+
+    def _build_toolbar(self) -> None:
+        tb = QToolBar("Main")
+        tb.setMovable(False)
+        tb.setIconSize(tb.iconSize())
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
+        for label, slot in (
+            ("Open",       self.open_pdb_dialog),
+            ("Docking",    self.open_docking_dialog),
+            ("Trajectory", self.open_trajectory_dialog),
+            ("AlphaFold",  self.open_alphafold_dialog),
+            ("Save",       self.save_pdb_dialog),
+            ("Snapshot",   self.take_snapshot),
+            ("Refresh",    self.refresh_viewport),
+            ("Center",     self.center_view),
+        ):
+            btn = QPushButton(label)
+            btn.clicked.connect(slot)
+            btn.setStyleSheet(
+                "QPushButton { background: #3a3a3a; color: #dcdcdc; "
+                "padding: 4px 12px; border: 1px solid #555; border-radius: 3px; }"
+                "QPushButton:hover { background: #4a4a4a; }"
+            )
+            tb.addWidget(btn)
+        tb.addSeparator()
+        self._render_label = QLabel("Cartoon")
+        self._render_label.setStyleSheet("color: #888; padding: 4px 12px;")
+        tb.addWidget(self._render_label)
+
+    def _build_central(self) -> None:
+        # Splitter: outliner | viewport+console | properties
+        outer = QSplitter(Qt.Orientation.Horizontal)
+        outer.addWidget(self.outliner)
+        outer.addWidget(self._build_center_stack())
+        outer.addWidget(self.properties)
+        outer.setStretchFactor(0, 0)
+        outer.setStretchFactor(1, 1)
+        outer.setStretchFactor(2, 0)
+        outer.setSizes([220, 760, 280])
+        outer.setStyleSheet("QSplitter::handle { background: #1a1a1a; }")
+        self.setCentralWidget(outer)
+
+    def _build_center_stack(self) -> QWidget:
+        v = QSplitter(Qt.Orientation.Vertical)
+        v.addWidget(self.viewport)
+        v.addWidget(self.console)
+        v.setStretchFactor(0, 3)
+        v.setStretchFactor(1, 1)
+        v.setStyleSheet("QSplitter::handle { background: #1a1a1a; }")
+        return v
+
+    # --------------------------------------------------------------- helpers
+    def _mk_action(self, label: str, shortcut, slot) -> QAction:
+        a = QAction(label, self)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        a.triggered.connect(slot)
+        return a
+
+    # --------------------------------------------------------------- slots
+    def open_pdb_dialog(self) -> None:
+        start_dir = str(Path(__file__).resolve().parents[3] / "examples")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open PDB file", start_dir,
+            "PDB files (*.pdb *.ent *.cif);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            obj = self.api.load(path)
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Failed to load PDB: {e}")
+            return
+        self._status_label.setText(f"Loaded {obj.molecule.summary()}")
+        self.refresh_viewport()
+
+    def save_pdb_dialog(self) -> None:
+        if not self.scene.objects:
+            QMessageBox.information(self, APP_NAME, "No objects to save.")
+            return
+        obj = self.scene.active or self.scene.objects[0]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save PDB file", f"{obj.name}.pdb",
+            "PDB files (*.pdb)",
+        )
+        if not path:
+            return
+        try:
+            save_pdb(obj.molecule, path)
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Failed to save: {e}")
+            return
+        self._status_label.setText(f"Saved {path}")
+
+    def open_docking_dialog(self) -> None:
+        """Open a Vina PDBQT or EquiScore directory of poses."""
+        start = str(Path(__file__).resolve().parents[3] / "examples")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open docking results", start,
+            "Docking files (*.pdbqt);;PDB files (*.pdb);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            poses = self.api.load_docking(path)
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Failed to load docking: {e}")
+            return
+        self._status_label.setText(
+            f"Loaded {len(poses)} docking poses ({poses[0].score:.2f} to "
+            f"{poses[-1].score:.2f} kcal/mol)"
+        )
+        self.refresh_viewport()
+
+    def open_trajectory_dialog(self) -> None:
+        """Open a topology PDB + trajectory file pair."""
+        start = str(Path(__file__).resolve().parents[3] / "examples")
+        top, _ = QFileDialog.getOpenFileName(
+            self, "Open topology PDB", start,
+            "PDB files (*.pdb)",
+        )
+        if not top:
+            return
+        traj_path, _ = QFileDialog.getOpenFileName(
+            self, "Open trajectory", os.path.dirname(top),
+            "Trajectory files (*.dcd *.xtc *.nc *.trr);;All files (*.*)",
+        )
+        if not traj_path:
+            return
+        # Load the topology as a scene object and bind the trajectory
+        try:
+            obj = self.api.load(top)
+            traj = self.api.load_trajectory(obj.name, top, traj_path)
+            self.api.metadata.setdefault("trajectories", {})[obj.name] = traj
+            self._status_label.setText(
+                f"Loaded trajectory {traj_path} ({traj.n_frames} frames) "
+                f"— use D.frame('{obj.name}', i, '{obj.name}') in console"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Failed to load trajectory: {e}")
+
+    def open_alphafold_dialog(self) -> None:
+        """Open an AlphaFold / Boltz-2 PDB; auto-applies pLDDT colouring."""
+        start = str(Path(__file__).resolve().parents[3] / "examples")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open AlphaFold prediction", start,
+            "PDB files (*.pdb *.cif);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            obj = self.api.load_alphafold(path)
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Failed to load: {e}")
+            return
+        info = self.api.plddt_summary(obj.name)
+        self._status_label.setText(
+            f"Loaded AlphaFold {obj.name} — mean pLDDT {info['mean_plddt']:.1f}"
+        )
+        self.refresh_viewport()
+
+    def take_snapshot(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save screenshot", "screenshot.png",
+            "PNG (*.png);;JPEG (*.jpg)",
+        )
+        if not path:
+            return
+        try:
+            self.viewport.screenshot(path)
+        except Exception as e:
+            QMessageBox.critical(self, APP_NAME, f"Snapshot failed: {e}")
+            return
+        self._status_label.setText(f"Snapshot saved to {path}")
+
+    def clear_scene(self) -> None:
+        self.scene.clear()
+        self.refresh_viewport()
+        self._status_label.setText("Scene cleared")
+
+    def center_view(self) -> None:
+        self.viewport.center_view()
+        self._status_label.setText("Centered view on centroid")
+
+    def refresh_viewport(self) -> None:
+        # Re-render via API: triggers headless rendering then update viewport
+        self.api.refresh()
+        # Sync viewport caches from headless viewport
+        self.viewport._meshes.clear()
+        for name, mesh in self.api.viewport.plots.items():
+            self.viewport._meshes[name] = mesh
+        self.viewport.refresh()
+
+    def toggle_wireframe(self) -> None:
+        # Toggle between solid and wireframe for every actor (best-effort)
+        if not hasattr(self.viewport.plotter, "actors"):
+            return
+        # We don't track per-actor state — just request a re-render
+        self.refresh_viewport()
+
+    def show_about(self) -> None:
+        QMessageBox.information(
+            self, "About",
+            f"{APP_NAME} v{APP_VERSION}\n\n"
+            "A Blender-like molecular viewer.\n"
+            "Python scripting via the embedded console.",
+        )
+
+    def _on_object_modified(self) -> None:
+        self.refresh_viewport()
+
+    def _on_scene_change(self, kind: str, payload) -> None:
+        if kind in ("add", "remove", "clear"):
+            self.refresh_viewport()
+        if kind == "update":
+            self.refresh_viewport()

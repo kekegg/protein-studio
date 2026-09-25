@@ -1,0 +1,48 @@
+[project]
+name            = "protein-studio"
+version         = "0.1.0"
+description     = "A Blender-like molecular viewer with embedded Python scripting."
+readme          = "README.md"
+requires-python = ">=3.10"
+authors         = [{ name = "Mavis" }]
+license         = { text = "MIT" }
+keywords        = ["molecular visualization", "PDB", "PySide6", "PyVista", "Blender-like"]
+classifiers     = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+
+dependencies = [
+    "PySide6>=6.6",
+    "pyvista>=0.43",
+    "pyvistaqt>=0.11",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "biotite>=0.39",
+]
+
+[project.scripts]
+protein-studio = "protein_studio.app:main"
+
+[project.urls]
+"Homepage" = "https://github.com/MiniMax/protein-studio"
+
+[build-system]
+requires      = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
