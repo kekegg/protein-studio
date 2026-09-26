@@ -762,32 +762,40 @@ def _group_runs(frames: List[_ResFrame]) -> List[tuple[str, List[_ResFrame]]]:
 def ribbon(
     mol: Molecule,
     scheme: ColorScheme | None = None,
-    helix_sheet_width: float = 1.3,
-    coil_width: float = 0.5,
-    thickness: float = 0.4,
-    quality: int = 12,
-    chain_subdiv: int = 4,
+    helix_width: float = 1.4,
+    sheet_width: float = 1.5,
+    coil_width: float = 0.45,
+    helix_thickness: float = 1.4,
+    sheet_thickness: float = 0.3,
+    coil_thickness: float = 0.45,
+    quality: int = 22,
+    chain_subdiv: int = 6,
+    smooth_window: int = 3,
 ) -> "object":
-    """SS-aware ribbon: a flat twisted strip following the chain.
+    """SS-aware PyMOL/3Dmol.js-style ribbon: per-SS cross-section shape with
+    smooth transitions.
 
-    Implements the 3Dmol.js / PyMOL "ribbon" representation. For every
-    residue, ``quality`` cross-section points are laid out perpendicular
-    to the chain direction spanning a width of ``helix_sheet_width``
-    (for helix/sheet) or ``coil_width`` (for coil). The strip is then
-    triangulated between consecutive samples, parallel-transported to
-    avoid twist, and extruded slightly along the binormal so it has
-    volume and catches Phong shading. Beta-sheet strands widen at the
-    C-terminal end into an arrowhead.
+    Cross-section varies by secondary structure to match the look of
+    PyMOL and 3Dmol.js:
 
-    For smoothness the backbone is also subdivided along the chain
-    direction with a Catmull-Rom-like interpolation, producing
-    ``chain_subdiv`` samples per residue interval. The end result is
-    a ribbon with roughly ``quality * chain_subdiv * n_residues``
-    vertices, smooth enough to look like a continuous twisting strip.
+    * **Helix** — round cylinder (radius ~``helix_width``/2).
+    * **Loop** — thin round tube (radius ~``coil_width``/2).
+    * **Sheet** — flat arrow (wide in side direction, thin in binormal).
 
-    Result: the protein backbone is rendered as a single continuous
-    ribbon that twists naturally with the chain — never as a uniform
-    cylinder or as disconnected disks.
+    The per-residue target ``(width, thickness)`` is smoothed along the
+    chain with a Gaussian kernel of half-width ``smooth_window`` so that
+    helix→loop or loop→sheet boundaries produce no abrupt geometric
+    jump — the cross-section smoothly tapers from one shape to the
+    other.
+
+    The backbone is also subdivided along the chain direction with
+    ``chain_subdiv`` Catmull-Rom-like samples per residue interval to
+    keep the strip smooth on tight bends. Beta-sheet strands widen at
+    the C-terminal end into an arrowhead.
+
+    Result: a smooth, continuous ribbon that twists naturally with the
+    chain, with the right shape for each SS and smooth transitions
+    between them — matching the look of PyMOL and 3Dmol.js.
     """
     pv = _safe_import_pyvista()
     scheme = scheme or ColorScheme("secondary", "secondary")
@@ -854,11 +862,38 @@ def ribbon(
             binormals[i] = binormals[i] / nrm if nrm > 1e-9 \
                 else np.array([0.0, 0.0, 1.0])
 
-        # Width per residue (helix/sheet wide, coil narrow)
-        widths = np.array([
-            helix_sheet_width if ss in ("helix", "sheet") else coil_width
-            for ss in ss_list
-        ], dtype=float)
+        # Per-residue target cross-section shape based on SS type.
+        # Helix = round cylinder (w ≈ t), Loop = thin tube (small w ≈ t),
+        # Sheet = flat arrow (w >> t).
+        target_w = np.zeros(n, dtype=float)
+        target_t = np.zeros(n, dtype=float)
+        for i, ss in enumerate(ss_list):
+            if ss == "helix":
+                target_w[i] = helix_width
+                target_t[i] = helix_thickness
+            elif ss == "sheet":
+                target_w[i] = sheet_width
+                target_t[i] = sheet_thickness
+            else:
+                target_w[i] = coil_width
+                target_t[i] = coil_thickness
+
+        # Smooth the per-residue (w, t) along the chain with a Gaussian
+        # kernel. This blends the cross-section shape across SS
+        # boundaries so we never see an abrupt geometry jump when the
+        # chain transitions from helix to loop or loop to sheet. Also
+        # creates a small "flare" at each transition which catches
+        # specular highlights nicely.
+        if n > 1 and smooth_window > 1:
+            half = max(1, smooth_window // 2)
+            xs = np.arange(-half, half + 1)
+            kernel = np.exp(-0.5 * (xs / max(0.5, half * 0.5)) ** 2)
+            kernel = kernel / kernel.sum()
+            widths = np.convolve(target_w, kernel, mode="same")
+            thickns = np.convolve(target_t, kernel, mode="same")
+        else:
+            widths = target_w.copy()
+            thickns = target_t.copy()
 
         # Mark sheet arrowhead: last two residues of each sheet run
         # become "arrow start" + "arrow end" so the strip widens at
@@ -883,6 +918,7 @@ def ribbon(
             new_side = [sides[0]]
             new_bin = [binormals[0]]
             new_w = [widths[0]]
+            new_th = [thickns[0]]
             new_ss_idx = [0]  # which residue each sample's color comes from
             for i in range(n - 1):
                 p1, p2 = positions[i], positions[i + 1]
@@ -890,6 +926,7 @@ def ribbon(
                 s1, s2 = sides[i], sides[i + 1]
                 b1, b2 = binormals[i], binormals[i + 1]
                 w1, w2 = widths[i], widths[i + 1]
+                th1, th2 = thickns[i], thickns[i + 1]
                 for k in range(1, chain_subdiv):
                     u = k / chain_subdiv
                     new_pos.append((1 - u) * p1 + u * p2)
@@ -901,6 +938,7 @@ def ribbon(
                     new_bin.append(bnew / bnrm if bnrm > 1e-9
                                     else np.array([0.0, 0.0, 1.0]))
                     new_w.append((1 - u) * w1 + u * w2)
+                    new_th.append((1 - u) * th1 + u * th2)
                     # Color comes from the closer residue for visual
                     # fidelity when crossing an SS boundary.
                     new_ss_idx.append(i if u < 0.5 else i + 1)
@@ -909,12 +947,14 @@ def ribbon(
                 new_side.append(s2)
                 new_bin.append(b2)
                 new_w.append(w2)
+                new_th.append(th2)
                 new_ss_idx.append(i + 1)
             positions = np.array(new_pos)
             tangents = np.array(new_tan)
             sides = np.array(new_side)
             binormals = np.array(new_bin)
             widths = np.array(new_w)
+            thickns = np.array(new_th)
             n = len(positions)
 
         # Apply arrow widening to the last 2 residues (in *original*
@@ -940,24 +980,36 @@ def ribbon(
                 if k > 0 and per_sample_orig[k - 1] == i_orig:
                     arrow_samples.add(k - 1)
         eff_widths = widths.copy()
+        eff_thicks = thickns.copy()
         for k in arrow_samples:
             eff_widths[k] *= 2.0
+            # Arrow stays flat: thickness stays small so it still reads
+            # as a flat arrow plate rather than a fat rod.
+            eff_thicks[k] = max(eff_thicks[k], sheet_thickness)
 
-        # Build the 2D grid of strip vertices: pts[cross, length].
-        # pts[j, k] = position[k] + delta_j * eff_widths[k] * side[k]
-        pts = np.zeros((num_cross, n, 3))
+        # Cross-section: per-sample ellipse in the (side, binormal) plane.
+        # `widths[k]` is the half-axis along the side direction,
+        # `thickns[k]` along the binormal. With helix (w ≈ t) the
+        # cross-section is a circle → reads as a true cylinder under
+        # Phong shading. With sheet (w >> t) it's a flat oval → reads
+        # as a flat arrow. With loop (w ≈ t small) it's a thin tube.
+        # Because widths/thickns are smoothed across SS boundaries, the
+        # cross-section smoothly tapers from one shape to the next.
+        full = np.zeros((num_cross, n, 3))
+        theta = np.linspace(0.0, 2.0 * np.pi, num_cross, endpoint=False)
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
         for k in range(n):
             w = eff_widths[k]
-            for j in range(num_cross):
-                delta = -1.0 + j * 2.0 / (num_cross - 1)
-                pts[j, k] = positions[k] + delta * w * sides[k]
-        # Flatten the top & bottom extrusion: ±thickness/2 along binormal
-        full = np.zeros((num_cross * 2, n, 3))
-        for k in range(n):
-            for j in range(num_cross):
-                p = pts[j, k]
-                full[j, k] = p + binormals[k] * thickness * 0.5
-                full[j + num_cross, k] = p - binormals[k] * thickness * 0.5
+            t = eff_thicks[k]
+            side_dir = sides[k]
+            bin = binormals[k]
+            # point in the (side, binormal) plane of the cross-section
+            full[:, k, :] = (
+                positions[k][None, :]
+                + (cos_t * w)[:, None] * side_dir[None, :]
+                + (sin_t * t * 0.5)[:, None] * bin[None, :]
+            )
 
         # Per-vertex color (one color per residue, interpolated)
         cols = np.zeros((full.shape[0], n, 3))
@@ -1002,6 +1054,17 @@ def ribbon(
         verts_arr = np.array(verts_list, dtype=float)
         faces_arr = np.hstack(faces_list).astype(np.int64)
         mesh = pv.PolyData(verts_arr, faces=faces_arr)
+        # Compute smooth vertex normals so Phong shading produces a
+        # glossy round surface instead of flat per-face shading
+        # (otherwise each quad reads as a distinct polygon).
+        try:
+            mesh.compute_normals(cell_normals=False,
+                                  point_normals=True,
+                                  auto_orient_normals=True,
+                                  feature_angle=60.0,
+                                  inplace=True)
+        except Exception:
+            pass
         # Assign per-cell color from cols[][]
         n_cells = mesh.n_cells
         cell_colors = np.zeros((n_cells, 3))

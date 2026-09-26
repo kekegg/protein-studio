@@ -89,9 +89,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     main_window.show()
 
     # Open any PDB files passed on the command line
-    for p in args.pdb or []:
+    pdb_paths = list(args.pdb or [])
+    # If none passed, auto-load examples/1aki.pdb so the user has
+    # something to look at immediately on first launch (easy to clear
+    # via Edit → Clear Scene).
+    if not pdb_paths:
+        default_pdb = Path(__file__).parent.parent.parent / "examples" / "1aki.pdb"
+        if default_pdb.exists():
+            pdb_paths.append(default_pdb)
+    for p in pdb_paths:
         if Path(p).exists():
-            api.load(p, representation="cartoon", scheme="secondary")
+            api.load(p, representation="ribbon", scheme="secondary")
 
     # Initial render
     main_window.refresh_viewport()
