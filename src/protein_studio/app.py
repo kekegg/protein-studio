@@ -78,10 +78,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     headless = args.headless or "PROTEIN_STUDIO_HEADLESS" in os.environ
     if headless:
         viewport_impl = HeadlessViewport()
+        api = StudioAPI(viewport=viewport_impl)
     else:
-        viewport_impl = None  # use the GUI widget below
-
-    api = StudioAPI(viewport=viewport_impl)
+        # GUI mode — the StudioAPI is bound to a *placeholder* viewport
+        # here; main_window.py:app.viewport is the real ViewportWidget
+        # that gets built right after. We set api.viewport later once
+        # the widget exists (see the wire-up below).
+        api = StudioAPI(viewport=HeadlessViewport())
+        viewport_impl = None
     api.scene = scene  # share the same Scene instance
     viewport_widget = ViewportWidget(scene) if not headless else None
     outliner  = OutlinerWidget(scene)
@@ -99,6 +103,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     main_window = MainWindow(scene, viewport_widget, outliner, properties,
                              console, PythonEditor({"D": api, "np": __import__("numpy")}),
                              api)
+    # GUI mode: point StudioAPI at the real ViewportWidget so MCP-driven
+    # load_pdb / set_representation / etc. actually render into the
+    # user's 3D window. The HeadlessViewport we used as a placeholder
+    # is now orphaned (and harmless — nothing references it).
+    if not headless and viewport_widget is not None:
+        api.viewport = viewport_widget
     main_window.show()
 
     # Belt-and-suspenders shutdown: even if closeEvent is bypassed

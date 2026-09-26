@@ -99,6 +99,14 @@ class MainWindow(QMainWindow):
         self._mcp.set_api(api)
         self._mcp.state_changed.connect(self._on_mcp_state_changed)
         self._mcp.server_url_changed.connect(self._on_mcp_url_changed)
+        # Auto-start the MCP server 500ms after the GUI is up, so
+        # external clients (e.g. agent integration tests) can attach
+        # immediately without the user clicking Tools → Start MCP
+        # Server. The slot itself is idempotent (no-op if already
+        # running), so this is safe even if the user manually started
+        # it earlier.
+        from PySide6.QtCore import QTimer as _Q
+        _Q.singleShot(500, self._on_mcp_start)
         self._mcp_status_label = QLabel("MCP: stopped")
         self._mcp_status_label.setStyleSheet(
             "QLabel { padding: 2px 10px; border: 1px solid #555; "

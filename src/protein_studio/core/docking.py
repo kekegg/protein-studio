@@ -159,18 +159,27 @@ def _parse_vina_pdbqt(path: str) -> List[DockingPose]:
 
 
 def _parse_pdb_text(text: str, name: str = "ligand") -> Molecule:
-    """Parse a single PDB blob using the existing PDB reader."""
+    """Parse a single PDB blob using the existing PDB reader.
+
+    The returned molecule's name is set to ``name`` — without this
+    override, ``load_pdb`` derives the name from the temp file's stem
+    (e.g. ``tmpk78876az``), which leaks into downstream SceneObject
+    names like ``pose_1_tmpk78876az`` and makes it impossible to
+    predict the object name after ``load_docking``.
+    """
     import tempfile
     with tempfile.NamedTemporaryFile("w", suffix=".pdb", delete=False) as fh:
         fh.write(text)
         path = fh.name
     try:
-        return load_pdb(path)
+        mol = load_pdb(path)
     finally:
         try:
             os.unlink(path)
         except OSError:
             pass
+    mol.name = name
+    return mol
 
 
 # ---------------------------------------------------------------- multi-PDB (EquiScore)

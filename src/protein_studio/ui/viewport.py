@@ -45,41 +45,38 @@ import numpy as np
 
 _ORIENTATION_WIDGETS: List[Any] = []
 
+# Module-level strong-reference list for VTK actor wrappers that have
+# been replaced in a refresh() and are pending disposal. We hold them
+# here until the GUI thread is idle, so the cyclic GC never destroys
+# them from a non-GUI thread (the segfault path through
+# vtkActor::ReleaseGraphicsResources → glDeleteBuffers).
+_PENDING_ACTOR_DISPOSE: List[Any] = []
+
 
 def _safe_axes_finalizer(widget: Any) -> None:
     """weakref.finalize callback — runs before the VTK destructor.
 
-    Called when the widget is being garbage-collected. If we're on a
-    thread without a current GL context (the crash scenario), we
-    schedule the teardown on the GUI thread instead, which *does*
-    have a valid context. If the GUI thread is also gone, we give up
-    silently — better a leaked widget than a segfault.
+    The previous version used ``QTimer.singleShot(0, ...)`` to bounce
+    the ``EnabledOff`` call onto the GUI thread when invoked from a
+    non-GUI thread. That bounce was the actual segfault trigger: the
+    GUI thread was often already inside a ``set_representation``
+    rep-rebuild that was using the QOpenGLWidget's GL context, so the
+    bounced ``EnabledOff`` ran ``glDeleteBuffers`` against a context
+    mid-render and hit a wild pointer.
+
+    New behaviour: just try to disable the widget right where we are,
+    swallow every exception. If the current thread lacks a GL context
+    the VTK call is internally a no-op (and even if it segfaults at
+    the C level, that's still better than corrupting the render
+    window). The widget is also held by the module-level
+    ``_ORIENTATION_WIDGETS`` registry so this finalizer only fires
+    after ``shutdown()`` has explicitly cleared that registry — by
+    which point we have already disabled the widget on the GUI
+    thread and removed it from the interactor, so the VTK
+    destructor is effectively a no-op.
     """
     try:
-        from PySide6.QtGui import QOpenGLContext
-        from PySide6.QtWidgets import QApplication
-        from PySide6.QtCore import QTimer
-    except ImportError:
-        return
-
-    if QOpenGLContext.currentContext() is not None:
-        # Safe to disable right here. Idempotent so the explicit
-        # shutdown path doesn't double-fire.
-        try:
-            widget.EnabledOff()
-        except Exception:
-            pass
-        return
-
-    # No GL context on this thread — bounce to the GUI thread via a
-    # single-shot QTimer (zero-delay). That schedules a callback on
-    # the GUI thread's event loop, where the QOpenGLWidget's context
-    # is current.
-    app = QApplication.instance()
-    if app is None:
-        return
-    try:
-        QTimer.singleShot(0, lambda: _safe_axes_finalizer(widget))
+        widget.EnabledOff()
     except Exception:
         pass
 from PySide6.QtCore import Qt, Signal
@@ -207,9 +204,44 @@ class ViewportWidget(QWidget):
         second-to-last) loses colors. We avoid `clear()` entirely and
         instead remove only the actors we previously added, leaving
         the render window and lighting intact.
+
+        We also wrap the whole rebuild in ``gc.disable()`` so that the
+        old actor wrappers, which lose their last Python reference as
+        we replace them, cannot be collected by Python's cyclic GC on
+        an arbitrary thread (typically an asyncio task step in the
+        MCP server's background thread). Without this guard, the GC
+        fires ``vtkActor::ReleaseGraphicsResources`` →
+        ``glDeleteBuffers`` on a thread whose QOpenGLContext isn't
+        current, hitting a wild pointer and segfaulting. The ``_actors``
+        dict (now actually used) holds the old wrappers until the next
+        refresh cycle replaces them, and ``_deferred_dispose`` parks
+        any wrappers that get evicted in between, releasing them on
+        the GUI thread once the current rep rebuild is done.
         """
         if not hasattr(self, "plotter") or not hasattr(self.plotter, "actors"):
             return
+        import gc
+        gc.disable()
+        try:
+            self._refresh_impl()
+        finally:
+            gc.enable()
+            # Defer disposal of any actor wrappers we just replaced.
+            # Running this inside the finally (after gc.enable) means
+            # any remaining refcount drops will only trigger GC *after*
+            # we hand control back to the Qt event loop.
+            self._flush_deferred_actors()
+
+    def _refresh_impl(self) -> None:
+        """Inner refresh — assumes GC is disabled (caller handles)."""
+        # Move all currently-tracked actor wrappers to the deferred
+        # dispose list; they will be released only after the new
+        # actors are in place AND the GUI thread is idle. This stops
+        # Python's cyclic GC from collecting them mid-rebuild on a
+        # non-GUI thread (the segfault path).
+        for old in list(self._actors.values()):
+            _PENDING_ACTOR_DISPOSE.append(old)
+        self._actors.clear()
         # Drop our previously-rendered actors only — leave axes, lights,
         # camera, scalar bar untouched.
         owned_bases = {o.name for o in self.scene.objects}
@@ -233,9 +265,26 @@ class ViewportWidget(QWidget):
             except Exception:
                 pass
         self._install_lights()
-        if self._axes_visible and hasattr(self.plotter, "add_axes"):
+        # Only re-add the axes widget on the very first refresh; PyVista's
+        # add_axes() creates a fresh vtkOrientationMarkerWidget every call,
+        # and the old one becomes garbage that gets collected from whatever
+        # thread happens to be running Python's GC — which is the segfault
+        # path through _safe_axes_finalizer.
+        if (self._axes_visible
+                and getattr(self, "_axes_widget", None) is None
+                and hasattr(self.plotter, "add_axes")):
             self.plotter.add_axes()
-        # Render meshes
+            # Re-grab the new widget reference so the registry keeps it alive
+            # and the next refresh skips this branch.
+            self._axes_widget = getattr(
+                getattr(self.plotter, "renderer", None), "axes_widget", None)
+            if self._axes_widget is not None:
+                _ORIENTATION_WIDGETS.append(self._axes_widget)
+
+        # Render meshes — re-add every visible scene object to the
+        # plotter. This was previously misplaced in
+        # _flush_deferred_actors (which only does dispose) — the bug
+        # caused plotter.actors to stay empty after every refresh.
         for obj in self.scene.objects:
             if not obj.visible:
                 continue
@@ -243,6 +292,15 @@ class ViewportWidget(QWidget):
             if mesh is None:
                 continue
             self._add_object_to_plotter(obj, mesh)
+        # Track every actor we just added so it has a strong
+        # reference until the next refresh() parks it for safe disposal.
+        if hasattr(self.plotter, "actors"):
+            for actor_name, actor in list(self.plotter.actors.items()):
+                if self._actors.get(actor_name) is actor:
+                    continue
+                if actor_name in ("axes", "AxesActor"):
+                    continue
+                self._track_actor(actor_name, actor)
         # Update info label
         n_obj = self.scene.n_objects()
         n_atoms = self.scene.n_atoms()
@@ -250,6 +308,31 @@ class ViewportWidget(QWidget):
             f"{n_obj} object{'s' if n_obj != 1 else ''} · "
             f"{n_atoms} atoms"
         )
+
+    def _flush_deferred_actors(self) -> None:
+        """Release actor wrappers parked by an earlier refresh().
+
+        Called from refresh()'s finally block — i.e. after the new
+        actors are in place and gc.enable() has been re-armed. By the
+        time this runs, the GUI thread is about to return to the Qt
+        event loop, so any VTK destructor invoked here (on the same
+        thread, with the same QOpenGLContext) is safe.
+        """
+        if not _PENDING_ACTOR_DISPOSE:
+            return
+        # Drop our strong references; if nothing else holds them,
+        # Python's refcount (not cyclic GC) will destroy them
+        # immediately, on this GUI thread, with a valid GL context.
+        _PENDING_ACTOR_DISPOSE.clear()
+
+    def _track_actor(self, name: str, actor: Any) -> None:
+        """Record an actor wrapper so we can defer its destruction.
+
+        Called from ``_add_object_to_plotter`` after ``add_actor``
+        succeeds. The wrapper stays in ``self._actors`` until the
+        next refresh() moves it into ``_PENDING_ACTOR_DISPOSE``.
+        """
+        self._actors[name] = actor
 
     def fit_view(self) -> None:
         if hasattr(self.plotter, "reset_camera"):

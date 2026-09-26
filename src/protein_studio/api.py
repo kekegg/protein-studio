@@ -333,7 +333,7 @@ class StudioAPI:
         colors = poses_to_color_array(poses)
         for pose, color in zip(poses, colors):
             obj = SceneObject(
-                name=f"pose_{pose.rank}_{pose.ligand.name}",
+                name=f"pose_{pose.rank}",
                 molecule=pose.ligand,
                 representation="ball_and_stick",
                 color_scheme=ColorScheme(
@@ -345,14 +345,29 @@ class StudioAPI:
 
     # ----------------------------------------------------------- rendering
     def refresh(self) -> None:
-        """Re-render every object in the scene."""
-        from .core.representations import build_mesh
-        self.viewport.clear()
-        for obj in self.scene.objects:
-            if not obj.visible:
-                continue
-            mesh = build_mesh(obj, obj.color_scheme)
-            self.viewport.add(obj.name, mesh)
+        """Re-render every object in the scene.
+
+        Two paths depending on viewport type:
+          - HeadlessViewport: clear its ``plots`` dict, build meshes,
+            store them under each object name. ``screenshot()``
+            consumes the dict to render an off-screen image.
+          - ViewportWidget (the GUI's Qt widget — set by app.py:106
+            when we run with a window): delegate to its own
+            ``refresh()`` which already maintains the actor list in
+            sync with the scene.
+        """
+        if hasattr(self.viewport, "_refresh_impl"):
+            # GUI viewport — let it drive the render window.
+            self.viewport.refresh()
+        else:
+            # Headless viewport (or any other plot-bag style).
+            from .core.representations import build_mesh
+            self.viewport.clear()
+            for obj in self.scene.objects:
+                if not obj.visible:
+                    continue
+                mesh = build_mesh(obj, obj.color_scheme)
+                self.viewport.add(obj.name, mesh)
         self._dirty = False
 
     def screenshot(self, path: str, **kwargs) -> str:

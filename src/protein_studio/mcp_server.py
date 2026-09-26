@@ -52,7 +52,6 @@ from .core.colors import SCHEME_PRESETS
 from .core.representations import available_representations
 from .core.scene import SceneObject
 
-
 # ---------------------------------------------------------------------------
 # Tool catalog
 # ---------------------------------------------------------------------------
@@ -308,7 +307,12 @@ def _dispatch(name: str, arguments: Dict[str, Any],
         api.center_view()
         return {"ok": True}
     if name == "rotate":
-        pv_plotter = api.viewport.plotter
+        pv_plotter = getattr(api.viewport, "plotter", None)
+        if pv_plotter is None:
+            return {"warning":
+                    "rotate() requires a GUI viewport (the bundled "
+                    "HeadlessViewport used for headless rendering has no "
+                    "plotter). Run the protein-studio GUI to use rotate."}
         pv_plotter.camera.Azimuth(float(arguments["angle"]))
         pv_plotter.render()
         return {"azimuth_deg": pv_plotter.camera.azimuth}
@@ -327,10 +331,10 @@ def _dispatch(name: str, arguments: Dict[str, Any],
         limit = arguments.get("limit", 50)
         hbs = _detect(obj.molecule)
         return [{
-            "donor": f"{hb.donor_residue.resname}{hb.donor_residue.number}",
+            "donor": f"{hb.donor.residue.name}{hb.donor.residue.number}",
             "donor_atom": hb.donor.name,
-            "acceptor": f"{hb.acceptor_residue.resname}"
-                       f"{hb.acceptor_residue.number}",
+            "acceptor": f"{hb.acceptor.residue.name}"
+                       f"{hb.acceptor.residue.number}",
             "acceptor_atom": hb.acceptor.name,
             "distance": round(hb.distance, 3),
         } for hb in hbs[:limit]]

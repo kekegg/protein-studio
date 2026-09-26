@@ -34,9 +34,7 @@ talk JSON-RPC to the server — that's the MCP client's job.
 
 from __future__ import annotations
 
-import asyncio
 import sys
-import threading
 from pathlib import Path
 from typing import Optional
 
@@ -51,87 +49,6 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-class _ServerRunner(QObject):
-    """Drives the asyncio loop for the in-process MCP server.
-
-    One instance lives in a plain ``threading.Thread`` (not ``QThread``
-    — Qt's event loop and asyncio.run don't always cooperate cleanly
-    when nested). Signals are emitted from the worker thread; Qt
-    delivers them on the GUI thread automatically.
-    """
-
-    state_changed = Signal(str)
-    log_line = Signal(str)
-    ready = Signal(str)  # emitted once server is listening (URL)
-
-    def __init__(self, api, host: str, port: int):
-        super().__init__()
-        self._api = api
-        self._host = host
-        self._port = port
-        self._stop_event: Optional[asyncio.Event] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-
-    def request_stop(self) -> None:
-        """Called from any thread. Signals the asyncio loop to shut down."""
-        if self._loop is not None and self._stop_event is not None:
-            try:
-                # Schedule set() on the worker's loop from this thread.
-                self._loop.call_soon_threadsafe(self._stop_event.set)
-            except Exception:
-                pass
-
-    def run_forever_sync(self) -> None:
-        """Thread entry point — wraps the async driver in asyncio.run."""
-        try:
-            asyncio.run(self.run_forever())
-        except Exception as exc:
-            self.log_line.emit(f"# server thread crashed: {exc!r}")
-            self.state_changed.emit("failed")
-
-    async def run_forever(self) -> None:
-        """Coroutine that drives one server lifetime."""
-        from ..mcp_server import serve_http
-        self._loop = asyncio.get_running_loop()
-        self._stop_event = asyncio.Event()
-        self.log_line.emit(
-            f"# starting MCP HTTP server on http://{self._host}:{self._port}/mcp")
-        try:
-            # serve_http blocks until uvicorn exits. Run it as a task
-            # so we can also wait for our own stop signal — when stop
-            # is requested we ask uvicorn to shut down.
-            server_task = asyncio.create_task(
-                serve_http(self._api,
-                           host=self._host,
-                           port=self._port,
-                           log_level="warning"))
-            # Mark running once uvicorn is actually serving (a tiny
-            # delay gives the socket time to bind).
-            self.state_changed.emit("running")
-            self.ready.emit(f"http://{self._host}:{self._port}/mcp")
-
-            # Wait for either uvicorn to exit on its own, or stop().
-            done, _ = await asyncio.wait(
-                {server_task,
-                 asyncio.create_task(self._stop_event.wait())},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            # If the user asked to stop, request uvicorn to shut down.
-            if not server_task.done():
-                server_task.cancel()
-                try:
-                    await server_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-        except asyncio.CancelledError:
-            self.log_line.emit("# server task cancelled")
-        except Exception as exc:
-            self.log_line.emit(f"# server crashed: {exc!r}")
-            self.state_changed.emit("failed")
-            return
-        finally:
-            self.state_changed.emit("stopped")
-            self.log_line.emit("# server stopped")
 
 
 class MCPController(QObject):
@@ -169,8 +86,7 @@ class MCPController(QObject):
         self._host = host
         self._port = port
         self._api = None  # set later via set_api()
-        self._thread: Optional[threading.Thread] = None
-        self._runner: Optional[_ServerRunner] = None
+        self._server: Optional["_QtMcpServer"] = None
         self._state = self._STATE_STOPPED
         self._url = ""
         self._log_lines: list[str] = []
@@ -194,7 +110,14 @@ class MCPController(QObject):
         self._api = api
 
     def start(self) -> None:
-        """Start the MCP HTTP server on a background thread.
+        """Start the MCP HTTP server in the GUI thread.
+
+        ``_QtMcpServer`` uses ``QTcpServer`` to listen for HTTP/1.1
+        requests and dispatches JSON-RPC to the bound ``StudioAPI``
+        synchronously. Because the server runs on the thread that
+        owns the QOpenGLWidget, viewport operations like
+        ``plotter.screenshot`` work without any cross-thread
+        marshalling.
 
         Safe to call when already running — it's a no-op then.
         Raises RuntimeError if ``set_api`` hasn't been called yet.
@@ -203,44 +126,31 @@ class MCPController(QObject):
             return
         if self._api is None:
             raise RuntimeError("set_api() must be called before start()")
-        if self._thread is not None and self._thread.is_alive():
-            # Stale thread from a previous run; wait briefly then drop.
-            self._thread.join(timeout=2.0)
-        self._thread = None
-        self._runner = None
-
-        runner = _ServerRunner(self._api, self._host, self._port)
-        runner.state_changed.connect(self._on_runner_state)
-        runner.log_line.connect(self._append_log)
-        runner.ready.connect(self._on_runner_ready)
-
-        thread = threading.Thread(
-            target=runner.run_forever_sync,
-            name="mcp-http-server",
-            daemon=True,
-        )
-        self._thread = thread
-        self._runner = runner
+        # Lazy import to avoid pulling PySide6 at module import time
+        # (lets CLI/headless mode load mcp_controller without Qt).
+        from ..mcp_qt_server import _QtMcpServer
+        server = _QtMcpServer(self._host, self._port, parent=self)
+        server.bind_api(self._api)
+        server.state_changed.connect(self._on_runner_state)
+        server.log_line.connect(self._append_log)
+        server.ready.connect(self._on_runner_ready)
+        self._server = server
         self._set_state(self._STATE_STARTING)
-        self._append_log(f"# spawning server thread on "
+        self._append_log(f"# starting GUI-thread server on "
                          f"{self._host}:{self._port}")
-        thread.start()
+        if not server.start():
+            self._server = None
+            self._set_state(self._STATE_FAILED)
 
     def stop(self) -> None:
         """Ask the server to stop. No-op if not running."""
-        if self._runner is None or self._state == self._STATE_STOPPED:
+        if self._server is None or self._state == self._STATE_STOPPED:
             return
         if self._state == self._STATE_STOPPING:
             return
         self._set_state(self._STATE_STOPPING)
-        self._append_log("# stop requested — shutting down uvicorn")
-        self._runner.request_stop()
-        # Give the thread up to 5 s to exit cleanly.
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            if self._thread.is_alive():
-                self._append_log("# thread did not exit in 5s — "
-                                  "abandoning (daemon will die with process)")
+        self._append_log("# stop requested — closing QTcpServer")
+        self._server.stop()
 
     def show_log(self, parent: Optional[QObject] = None) -> None:
         """Open (or focus) a small dialog with the captured log."""
