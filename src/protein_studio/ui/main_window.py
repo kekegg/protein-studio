@@ -24,13 +24,14 @@ from PySide6.QtGui import QAction, QKeySequence, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QFileDialog, QMessageBox, QSplitter, QWidget, QVBoxLayout,
     QToolBar, QStatusBar, QLabel, QDockWidget, QApplication, QPushButton,
-    QHBoxLayout, QToolButton,
+    QHBoxLayout, QToolButton, QTabWidget,
 )
 
 from ..api import StudioAPI
 from ..core.io import load_pdb, save_pdb
 from ..core.scene import Scene
 from .console import PythonConsole
+from .editor import PythonEditor
 from .outliner import OutlinerWidget
 from .properties import PropertiesWidget
 from .viewport import ViewportWidget
@@ -45,7 +46,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self, scene: Scene, viewport: ViewportWidget,
                  outliner: OutlinerWidget, properties: PropertiesWidget,
-                 console: PythonConsole, api: StudioAPI,
+                 console: PythonConsole, editor: PythonEditor,
+                 api: StudioAPI,
                  parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.scene = scene
@@ -53,6 +55,7 @@ class MainWindow(QMainWindow):
         self.outliner = outliner
         self.properties = properties
         self.console = console
+        self.editor = editor
         self.api = api
 
         self.setWindowTitle(APP_NAME)
@@ -197,7 +200,22 @@ class MainWindow(QMainWindow):
     def _build_center_stack(self) -> QWidget:
         v = QSplitter(Qt.Orientation.Vertical)
         v.addWidget(self.viewport)
-        v.addWidget(self.console)
+        # Tabbed bottom pane: REPL console + script editor share the
+        # same Python namespace so variables / imports / the API
+        # handle (`D`) cross over freely.
+        self._bottom_tabs = QTabWidget()
+        self._bottom_tabs.setDocumentMode(True)
+        self._bottom_tabs.setStyleSheet(
+            "QTabWidget::pane { border-top: 1px solid #1a1a1a; background: #1d1d1d; }"
+            "QTabBar::tab { background: #2a2a2a; color: #dcdcdc; padding: 6px 16px; "
+            "border: 1px solid #1a1a1a; border-bottom: none; }"
+            "QTabBar::tab:selected { background: #1d1d1d; color: #fff; "
+            "border-bottom: 2px solid #3b76c2; }"
+            "QTabBar::tab:hover { background: #353535; }"
+        )
+        self._bottom_tabs.addTab(self.console, "Console")
+        self._bottom_tabs.addTab(self.editor, "Script")
+        v.addWidget(self._bottom_tabs)
         v.setStretchFactor(0, 3)
         v.setStretchFactor(1, 1)
         v.setStyleSheet("QSplitter::handle { background: #1a1a1a; }")

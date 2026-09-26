@@ -42,6 +42,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     from .ui.outliner import OutlinerWidget
     from .ui.properties import PropertiesWidget
     from .ui.console import PythonConsole
+    from .ui.editor import PythonEditor
     from .ui.main_window import MainWindow
 
     # Dark palette (Blender-like)
@@ -95,7 +96,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         api.screenshot(args.output)
         return 0
 
-    main_window = MainWindow(scene, viewport_widget, outliner, properties, console, api)
+    main_window = MainWindow(scene, viewport_widget, outliner, properties,
+                             console, PythonEditor({"D": api, "np": __import__("numpy")}),
+                             api)
     main_window.show()
 
     # Open any PDB files passed on the command line
