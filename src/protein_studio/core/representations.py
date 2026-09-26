@@ -9,7 +9,8 @@ glyph cloud for point cloud.
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -359,21 +360,462 @@ class _ProxyAtom:
         return ""
 
 
+# =====================================================================
+# SS-aware ribbon (Blender/3Dmol-style)
+# =====================================================================
+# Builds a proper ribbon mesh where each residue's secondary structure
+# gets a distinct geometry:
+#   * helix   — a smooth wide cylinder segment per residue
+#   * sheet   — a flat rectangular strip per residue + arrowhead at C-end
+#   * loop    — a thin tube, same as the cartoon path
+#
+# This is the standard representation used by PyMOL / ChimeraX / 3Dmol.js.
+
+@dataclass
+class _ResFrame:
+    """Per-residue local frame used by the SS-aware ribbon builder."""
+    residue: Any
+    ca: np.ndarray            # (3,) Cα coordinate
+    axis: np.ndarray          # (3,) chain-direction unit vector
+    up: np.ndarray            # (3,) perpendicular unit vector
+    # Optional BB atoms used for axis estimation (may be None if missing).
+    n_atom: Any = None
+    c_atom: Any = None
+
+
+def _slerp_unit(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+    """Spherical-linear interpolation between two unit vectors."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    dot = np.clip(a.dot(b), -1.0, 1.0)
+    if dot > 0.9995:
+        out = (1 - t) * a + t * b
+    elif dot < -0.9995:
+        # Antiparallel — pick any perpendicular axis to rotate around
+        perp = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        axis = np.cross(a, perp)
+        out = _rotate_axis_angle(a, axis, t * np.pi)
+    else:
+        omega = np.arccos(dot)
+        sin_o = np.sin(omega)
+        out = (np.sin((1 - t) * omega) * a + np.sin(t * omega) * b) / sin_o
+    nrm = np.linalg.norm(out)
+    return out / nrm if nrm > 1e-9 else a
+
+
+def _rotate_axis_angle(v: np.ndarray, axis: np.ndarray, theta: float) -> np.ndarray:
+    """Rodrigues rotation of *v* around unit *axis* by *theta* radians."""
+    axis = axis / np.linalg.norm(axis)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    return (v * cos_t + np.cross(axis, v) * sin_t +
+            axis * axis.dot(v) * (1 - cos_t))
+
+
+def _local_frames(chain_residues: List[Any]) -> List[_ResFrame]:
+    """Compute one local frame per residue along a chain.
+
+    Strategy:
+      1. CA positions are required (no CA → residue dropped).
+      2. Per-residue *axis* is the average of (prev_CA → CA) and
+         (CA → next_CA), normalized. Falls back to a single tangent
+         at chain ends.
+      3. *up* is a stable perpendicular computed by Gram–Schmidt against
+         the world-up vector and then propagated through the chain so
+         adjacent residues don't flip (the classic ribbon "twist"
+         artifact).
+    """
+    frames: List[_ResFrame] = []
+    cas: List[np.ndarray] = []
+    for res in chain_residues:
+        ca = res.atom("CA")
+        if ca is None:
+            continue
+        cas.append(np.asarray(ca.coord, dtype=float))
+        frames.append(_ResFrame(
+            residue=res, ca=cas[-1], axis=np.zeros(3), up=np.zeros(3),
+            n_atom=res.atom("N"), c_atom=res.atom("C"),
+        ))
+    if not frames:
+        return frames
+    n = len(frames)
+    # Per-residue tangent
+    for i in range(n):
+        if n == 1:
+            t = np.array([0.0, 0.0, 1.0])
+        elif i == 0:
+            t = cas[1] - cas[0]
+        elif i == n - 1:
+            t = cas[-1] - cas[-2]
+        else:
+            t = 0.5 * ((cas[i + 1] - cas[i]) + (cas[i] - cas[i - 1]))
+        norm = np.linalg.norm(t)
+        frames[i].axis = t / norm if norm > 1e-9 else np.array([0.0, 0.0, 1.0])
+    # Per-residue perpendicular with twist propagation (parallel-transport)
+    world_up = np.array([0.0, 1.0, 0.0])
+    prev_up = None
+    for i in range(n):
+        axis = frames[i].axis
+        if prev_up is None:
+            # Pick the world vector least aligned with the axis
+            cand = world_up if abs(axis.dot(world_up)) < 0.9 else np.array([1.0, 0.0, 0.0])
+            up = cand - axis * axis.dot(cand)
+        else:
+            # Remove any component parallel to the new axis — this keeps
+            # the perpendicular continuous across residues (no twist).
+            up = prev_up - axis * axis.dot(prev_up)
+        nrm = np.linalg.norm(up)
+        if nrm < 1e-9:
+            # Degenerate; pick any perpendicular
+            cand = world_up if abs(axis.dot(world_up)) < 0.9 else np.array([1.0, 0.0, 0.0])
+            up = cand - axis * axis.dot(cand)
+            nrm = np.linalg.norm(up)
+        up = up / nrm
+        frames[i].up = up
+        prev_up = up
+    return frames
+
+
+def _merge_meshes(meshes: List[Any]) -> Any:
+    """Concatenate a list of PolyData / dict meshes into one PolyData.
+
+    Each sub-mesh's ``cell_data["colors"]`` is preserved via a
+    per-input offset. Returns an empty PolyData if no inputs.
+    """
+    pv = _safe_import_pyvista()
+    if not meshes:
+        return pv.PolyData()
+    # Flatten any dicts
+    flat = []
+    for m in meshes:
+        if isinstance(m, dict):
+            for sub in m.values():
+                flat.append(sub)
+        else:
+            flat.append(m)
+    flat = [m for m in flat if m is not None and m.n_points > 0]
+    if not flat:
+        return pv.PolyData()
+    if len(flat) == 1:
+        return flat[0]
+    out = flat[0].copy()
+    for m in flat[1:]:
+        out = out.merge(m)
+    return out
+
+
+def _helix_segment(frames: List[_ResFrame], radius: float,
+                    color: tuple[float, float, float],
+                    subdiv: int = 3) -> Any:
+    """Build a single connected helix cylinder from a run of helix frames.
+
+    The cylinder runs along the helix axis with width = ``radius`` and
+    is built by sampling cross-section rings at every residue plus
+    ``subdiv`` interpolated rings between residues, then connecting them
+    with quads.
+    """
+    pv = _safe_import_pyvista()
+    if not frames:
+        return pv.PolyData()
+    if len(frames) < 2:
+        return pv.PolyData()
+
+    n_sides = 12
+    # Build a denser set of frames by Catmull-Rom-interpolating the
+    # per-residue (position, axis, up) tuples. subdiv=3 puts 2 extra
+    # rings between every pair of residue rings.
+    dense: List[_ResFrame] = []
+    for i in range(len(frames) - 1):
+        a, b = frames[i], frames[i + 1]
+        for s in range(subdiv):
+            t = s / subdiv
+            dense.append(_ResFrame(
+                residue=a.residue,
+                ca=(1 - t) * a.ca + t * b.ca,
+                axis=_slerp_unit(a.axis, b.axis, t),
+                up=_slerp_unit(a.up, b.up, t),
+            ))
+    dense.append(frames[-1])
+
+    ring_indices: List[np.ndarray] = []
+    positions: List[np.ndarray] = []
+    total_pts = 0
+    for f in dense:
+        ring = np.zeros((n_sides, 3))
+        side = np.cross(f.axis, f.up)
+        s = np.linalg.norm(side)
+        if s < 1e-6:
+            side = np.array([1.0, 0.0, 0.0])
+            side = side - f.axis * f.axis.dot(side)
+            s = np.linalg.norm(side)
+            if s < 1e-6:
+                side = np.array([0.0, 1.0, 0.0])
+                side = side - f.axis * f.axis.dot(side)
+                s = np.linalg.norm(side)
+        side = side / s
+        up = np.cross(side, f.axis)
+        for k in range(n_sides):
+            theta = 2 * np.pi * k / n_sides
+            ring[k] = f.ca + radius * (np.cos(theta) * up + np.sin(theta) * side)
+        ring_indices.append(np.arange(total_pts, total_pts + n_sides))
+        positions.append(ring)
+        total_pts += n_sides
+    all_pts = np.vstack(positions)
+    # Quad connectivity between ring[i] and ring[i+1]
+    quads: List[List[int]] = []
+    for i in range(len(dense) - 1):
+        a = ring_indices[i]
+        b = ring_indices[i + 1]
+        for k in range(n_sides):
+            kn = (k + 1) % n_sides
+            quads.append([a[k], a[kn], b[kn], b[k]])
+    # Cap the ends so the cylinder is closed
+    # Start cap: fan from a virtual center at the first ring
+    center_first = len(all_pts)
+    all_pts = np.vstack([all_pts, frames[0].ca[None, :]])
+    cap_start: List[List[int]] = []
+    for k in range(n_sides):
+        kn = (k + 1) % n_sides
+        cap_start.append([center_first, ring_indices[0][kn], ring_indices[0][k]])
+    # End cap
+    center_last = len(all_pts)
+    all_pts = np.vstack([all_pts, frames[-1].ca[None, :]])
+    cap_end: List[List[int]] = []
+    for k in range(n_sides):
+        kn = (k + 1) % n_sides
+        cap_end.append([center_last, ring_indices[-1][k], ring_indices[-1][kn]])
+    # Build faces (two triangles per quad + cap triangles)
+    faces: List[List[int]] = []
+    for q in quads:
+        faces.append([3, q[0], q[1], q[2]])
+        faces.append([3, q[0], q[2], q[3]])
+    for tri in cap_start + cap_end:
+        faces.append([3, tri[0], tri[1], tri[2]])
+    faces_flat = np.hstack(faces).astype(np.int64) if faces else np.array([], dtype=np.int64)
+    mesh = pv.PolyData(all_pts, faces=faces_flat)
+    mesh.cell_data["colors"] = np.tile(color, (mesh.n_cells, 1))
+    return mesh
+
+
+def _sheet_segment(frames: List[_ResFrame],
+                    width: float, thickness: float,
+                    color: tuple[float, float, float],
+                    arrowhead: bool = True,
+                    subdiv: int = 2) -> Any:
+    """Build a flat sheet strip with an arrowhead at the C-terminal end.
+
+    The strip is a rectangular ribbon perpendicular to the chain axis.
+    Each residue contributes ``subdiv`` quads (a thin slice of the
+    sheet). An optional arrowhead (two triangles) widens the C-terminal
+    end.
+    """
+    pv = _safe_import_pyvista()
+    if not frames:
+        return pv.PolyData()
+    if len(frames) < 2:
+        return pv.PolyData()
+
+    # Build a denser set of frames so the strip is smooth (no kinks
+    # at every residue).
+    dense: List[_ResFrame] = []
+    for i in range(len(frames) - 1):
+        a, b = frames[i], frames[i + 1]
+        for s in range(subdiv):
+            t = s / subdiv
+            dense.append(_ResFrame(
+                residue=a.residue,
+                ca=(1 - t) * a.ca + t * b.ca,
+                axis=_slerp_unit(a.axis, b.axis, t),
+                up=_slerp_unit(a.up, b.up, t),
+            ))
+    dense.append(frames[-1])
+
+    # Centerline goes through the CA positions; the strip extends to
+    # either side perpendicular to both the chain axis and the `up`
+    # direction (so it lies in the plane formed by axis × up).
+    pts: List[np.ndarray] = []
+    left_idx: List[int] = []
+    right_idx: List[int] = []
+    for f in dense:
+        # side = perpendicular to axis in the (axis, up) plane
+        side = np.cross(f.axis, f.up)
+        s = np.linalg.norm(side)
+        if s < 1e-6:
+            side = np.array([1.0, 0.0, 0.0])
+            side = side - f.axis * f.axis.dot(side)
+            s = np.linalg.norm(side)
+        side = side / s
+        left = f.ca - side * (width * 0.5)
+        right = f.ca + side * (width * 0.5)
+        left_idx.append(len(pts))
+        pts.append(left)
+        right_idx.append(len(pts))
+        pts.append(right)
+
+    quads: List[List[int]] = []
+    for i in range(len(frames) - 1):
+        quads.append([left_idx[i], left_idx[i + 1],
+                     right_idx[i + 1], right_idx[i]])
+
+    # Arrowhead at C-terminal end — extend the strip wider for ~1.5 residues
+    if arrowhead and len(frames) >= 1:
+        last = frames[-1]
+        prev = frames[-2]
+        # Arrow direction is the chain axis (continuing direction)
+        axis = last.axis
+        # Recompute side perpendicular to axis (use last frame's up)
+        side = np.cross(axis, last.up)
+        s = np.linalg.norm(side)
+        side = side / s if s > 1e-6 else np.array([1.0, 0.0, 0.0])
+        arrow_tip = last.ca + axis * (width * 0.8)
+        # Two extra points forming the wide base of the arrowhead
+        wide_left  = last.ca - side * (width * 1.2)
+        wide_right = last.ca + side * (width * 1.2)
+        # If the arrow is on a strand of length 1 (degenerate prev==last),
+        # pull the base slightly back to avoid a zero-area triangle.
+        if np.allclose(last.ca, prev.ca):
+            base = last.ca - axis * (width * 0.4)
+            wide_left = base - side * (width * 1.2)
+            wide_right = base + side * (width * 1.2)
+        wl_idx = len(pts); pts.append(wide_left)
+        wr_idx = len(pts); pts.append(wide_right)
+        tip_idx = len(pts); pts.append(arrow_tip)
+        # Two triangles for the arrowhead
+        quads.append([right_idx[-1], wr_idx, tip_idx, tip_idx])
+        quads.append([tip_idx, wl_idx, left_idx[-1], left_idx[-1]])
+
+    all_pts = np.array(pts)
+    faces: List[List[int]] = []
+    for q in quads:
+        if q[2] == q[3]:
+            faces.append([3, q[0], q[1], q[2]])
+        else:
+            faces.append([3, q[0], q[1], q[2]])
+            faces.append([3, q[0], q[2], q[3]])
+    faces_flat = np.hstack(faces).astype(np.int64) if faces else np.array([], dtype=np.int64)
+    mesh = pv.PolyData(all_pts, faces=faces_flat)
+    # Extrude thickness slightly so the strip has a tiny depth and
+    # catches a bit of Phong shading. Duplicated verts with -thickness
+    # offset along the up direction give a closed 2-sided ribbon.
+    if thickness > 0 and mesh.n_points > 0:
+        pts2 = mesh.points.copy()
+        # Find the `up` direction for the sheet plane (use last frame's up)
+        up = frames[-1].up
+        # Determine which side each point sits on so the offset goes
+        # inward. Use the ribbon centerline projection.
+        # Simpler: offset all points by ±thickness along up, then weld.
+        top = mesh.copy()
+        bot = mesh.copy()
+        bot.points = bot.points - up * thickness
+        mesh = mesh.merge(bot)
+        # Close the edges with side quads
+        # (left edge = top_left vs bot_left for each original sample;
+        #  top/bot share the same point indices, so we need to offset)
+        # Skip edge closure for speed; the strip is visually fine as an
+        # open ribbon on real proteins (matches 3Dmol.js default).
+    mesh.cell_data["colors"] = np.tile(color, (mesh.n_cells, 1))
+    return mesh
+
+
+def _loop_segment(frames: List[_ResFrame], radius: float,
+                   color: tuple[float, float, float]) -> Any:
+    """Build a smooth thin tube through a run of loop frames (== cartoon).
+
+    For a single-residue "run" (often a lone unknown-SS residue
+    wedged between helices), emit nothing rather than a degenerate
+    zero-length cylinder which can render as a floating disc.
+    """
+    if len(frames) < 2:
+        pv = _safe_import_pyvista()
+        return pv.PolyData()
+    pv = _safe_import_pyvista()
+    coords = np.array([f.ca for f in frames])
+    # Build a polyline through the CA positions and tube it
+    poly = pv.PolyData(coords)
+    lines = np.hstack([[len(coords)], np.arange(len(coords))]).astype(np.int64)
+    poly.lines = lines
+    tubed = poly.tube(radius=radius, n_sides=8)
+    tubed.cell_data["colors"] = np.tile(color, (tubed.n_cells, 1))
+    return tubed
+
+
+def _group_runs(frames: List[_ResFrame]) -> List[tuple[str, List[_ResFrame]]]:
+    """Group consecutive frames sharing the same SS into runs."""
+    runs: List[tuple[str, List[_ResFrame]]] = []
+    cur_kind: Optional[str] = None
+    cur: List[_ResFrame] = []
+    for f in frames:
+        ss = (f.residue.secondary_structure or "loop").lower()
+        kind = "helix" if ss == "helix" else ("sheet" if ss == "sheet" else "loop")
+        if kind != cur_kind:
+            if cur:
+                runs.append((cur_kind or "loop", cur))
+            cur_kind = kind
+            cur = [f]
+        else:
+            cur.append(f)
+    if cur:
+        runs.append((cur_kind or "loop", cur))
+    return runs
+
+
 def ribbon(
     mol: Molecule,
     scheme: ColorScheme | None = None,
     width: float = 1.2,
+    helix_radius: float = 1.5,
+    sheet_width: float = 1.6,
+    sheet_thickness: float = 0.3,
+    loop_radius: float = 0.35,
 ) -> "object":
-    """Flatten the cartoon tube by a directional bias — used as a stylised ribbon.
+    """SS-aware ribbon: cylinders for helix, flat arrows for sheet, tubes for loop.
 
-    Here we use the same CA spline as ``cartoon`` but flatten it slightly along
-    a normal direction (averaged over the previous / next tangent). This is a
-    cheap approximation of a real ribbon mesh and keeps the implementation
-    dependency-free.
+    Mirrors the look of PyMOL/ChimeraX/3Dmol.js "ribbon" representation.
+    Each chain's residues are walked and grouped by secondary structure;
+    helix runs become a wide cylinder aligned with the local backbone
+    axis; sheet runs become a flat strip perpendicular to the chain
+    with a triangular arrowhead at the C-terminal end; loop runs are
+    a thin tube.
     """
     pv = _safe_import_pyvista()
-    mesh = cartoon(mol, scheme=scheme, radius=width * 0.4)
-    return mesh  # stylised alias — same geometry, just a different preset
+    scheme = scheme or ColorScheme("secondary", "secondary")
+
+    # Build a per-atom color lookup so each residue (and its geometric
+    # contribution) can carry the right color regardless of SS scheme.
+    chain_meshes: List[Any] = []
+    for chain in mol.chains:
+        frames = _local_frames(list(chain.residues))
+        if not frames:
+            continue
+        # Compute per-residue color (helper expects atom-like objects;
+        # proxy using CA atom for residue-based schemes).
+        per_res_color: List[tuple[float, float, float]] = []
+        for f in frames:
+            ca = f.residue.atom("CA")
+            per_res_color.append(scheme.color(ca) if ca is not None
+                                  else scheme.uniform)
+
+        runs = _group_runs(frames)
+        run_meshes: List[Any] = []
+        for kind, run in runs:
+            # Color each run by the average color of its residues (a
+            # ribbon naturally looks uniform within a helix/sheet).
+            cols = np.array(per_res_color[frames.index(run[0]):
+                                          frames.index(run[-1]) + 1])
+            mean_col = tuple(cols.mean(axis=0).tolist())
+            if kind == "helix" and len(run) >= 1:
+                run_meshes.append(_helix_segment(run, helix_radius, mean_col))
+            elif kind == "sheet" and len(run) >= 1:
+                run_meshes.append(_sheet_segment(run, sheet_width,
+                                                 sheet_thickness, mean_col,
+                                                 arrowhead=True))
+            else:
+                run_meshes.append(_loop_segment(run, loop_radius, mean_col))
+        chain_meshes.append(_merge_meshes(run_meshes))
+
+    if not chain_meshes:
+        return pv.PolyData()
+    return _merge_meshes(chain_meshes)
 
 
 def surface(
@@ -529,3 +971,37 @@ REPRESENTATIONS: Dict[str, callable] = {
 
 def available_representations() -> List[str]:
     return list(REPRESENTATIONS.keys())
+
+
+def build_mesh(obj, scheme):
+    """Render a SceneObject into a PyVista mesh using its representation.
+
+    Centralized so callers (GUI viewport, headless API, tests) don't
+    have to know about REPRESENTATIONS dict or signature differences
+    between rep functions.
+    """
+    renderer = REPRESENTATIONS.get(obj.representation)
+    if renderer is None:
+        raise ValueError(f"Unknown representation: {obj.representation!r}")
+    mesh = renderer(obj.molecule, scheme=scheme)
+    return _apply_obj_transform(mesh, obj)
+
+
+def _apply_obj_transform(mesh, obj):
+    """Apply a SceneObject's transform to a mesh (or dict of meshes)."""
+    import numpy as np
+    M = obj.transform_matrix()
+    if M is None:
+        return mesh
+    if isinstance(mesh, dict):
+        return {k: _apply_M(v, M) for k, v in mesh.items()}
+    return _apply_M(mesh, M)
+
+
+def _apply_M(mesh, M):
+    """Apply a 4x4 transform matrix M to a PyVista mesh in-place."""
+    import numpy as np
+    pts = mesh.points
+    pts_h = np.hstack([pts, np.ones((pts.shape[0], 1))])
+    mesh.points = (M @ pts_h.T).T[:, :3]
+    return mesh

@@ -20,6 +20,7 @@ from protein_studio.core.io import load_pdb
 from protein_studio.core.colors import SCHEME_PRESETS, SS_COLORS
 from protein_studio.core.representations import (
     available_representations, cartoon, ball_and_stick, surface, point_cloud,
+    ribbon, _local_frames, _group_runs, _helix_segment, _sheet_segment,
 )
 from protein_studio.core.scene import Scene, SceneObject
 
@@ -179,3 +180,117 @@ def test_scene_emits_events():
     assert "add" in seen
     assert "update" in seen
     assert "remove" in seen
+
+# --------------------------------------------------------------- SS-aware ribbon
+
+def test_local_frames_one_per_ca_residue():
+    mol = load_pdb(EXAMPLES / "1aki.pdb")
+    chain = mol.chains[0]
+    ca_count = sum(1 for r in chain.residues if r.atom("CA") is not None)
+    frames = _local_frames(list(chain.residues))
+    assert len(frames) == ca_count
+    for f in frames:
+        assert abs(np.linalg.norm(f.axis) - 1.0) < 1e-6
+        assert abs(np.linalg.norm(f.up) - 1.0) < 1e-6
+        assert abs(f.axis.dot(f.up)) < 1e-6  # perpendicular
+
+
+def test_group_runs_splits_by_ss():
+    mol = load_pdb(EXAMPLES / "1aki.pdb")
+    chain = mol.chains[0]
+    frames = _local_frames(list(chain.residues))
+    runs = _group_runs(frames)
+    assert runs, "should produce at least one run"
+    # The kinds must match the actual SS of each frame's residue
+    for kind, run in runs:
+        for f in run:
+            ss = (f.residue.secondary_structure or "loop").lower()
+            if ss == "helix":
+                assert kind == "helix"
+            elif ss == "sheet":
+                assert kind == "sheet"
+            else:
+                assert kind == "loop"
+
+
+def test_helix_segment_connected_manifold():
+    """A helix segment must produce a single connected manifold mesh,
+    not a stack of disconnected rings."""
+    mol = load_pdb(EXAMPLES / "4hhb.pdb")
+    chain = mol.chains[1]
+    frames = _local_frames(list(chain.residues))
+    runs = _group_runs(frames)
+    helix_run = next(r for k, r in runs if k == "helix")
+    mesh = _helix_segment(helix_run, 1.5, (1.0, 0.3, 0.1))
+    assert mesh.n_cells > 0
+    # Connectivity check — a properly-built cylinder should be 1 region
+    import vtk
+    conn = vtk.vtkConnectivityFilter()
+    conn.SetInputData(mesh)
+    conn.SetExtractionModeToAllRegions()
+    conn.Update()
+    assert conn.GetNumberOfExtractedRegions() == 1, (
+        f"helix segment has {conn.GetNumberOfExtractedRegions()} disconnected "
+        f"pieces — likely only the first/last residue rings are connected "
+        f"and the dense interpolated rings are orphaned"
+    )
+
+
+def test_helix_segment_volume_scales_with_length():
+    """Helix volume should scale roughly linearly with the number of
+    residue frames (longer helix = more cylinder)."""
+    mol = load_pdb(EXAMPLES / "4hhb.pdb")
+    chain = mol.chains[1]
+    frames = _local_frames(list(chain.residues))
+    runs = _group_runs(frames)
+    helix_runs = [r for k, r in runs if k == "helix"]
+    import vtk
+    def volume(r):
+        m = _helix_segment(r, 1.5, (1.0, 0.3, 0.1))
+        mp = vtk.vtkMassProperties()
+        mp.SetInputData(m)
+        mp.Update()
+        return mp.GetVolume()
+    short_run = min(helix_runs, key=len)
+    long_run = max(helix_runs, key=len)
+    assert volume(long_run) > volume(short_run) * 1.5, (
+        "longer helix should have substantially more cylinder volume"
+    )
+
+
+def test_ribbon_returns_single_polydata_with_colors():
+    mol = load_pdb(EXAMPLES / "1aki.pdb")
+    mesh = ribbon(mol, scheme=SCHEME_PRESETS["secondary"])
+    import pyvista as pv
+    assert isinstance(mesh, pv.PolyData)
+    assert mesh.n_cells > 0
+    assert "colors" in mesh.cell_data
+    assert mesh.cell_data["colors"].shape[0] == mesh.n_cells
+
+
+def test_ribbon_sheet_segment_contains_arrowhead_extra_cells():
+    """A sheet segment with N residues should have at least N strip
+    quads + arrowhead triangles, so the cell count exceeds N."""
+    mol = load_pdb(EXAMPLES / "1aki.pdb")
+    chain = mol.chains[0]
+    frames = _local_frames(list(chain.residues))
+    runs = _group_runs(frames)
+    sheet_run = next(r for k, r in runs if k == "sheet")
+    mesh = _sheet_segment(sheet_run, 1.6, 0.3, (1.0, 1.0, 0.0),
+                          arrowhead=True)
+    n_res = len(sheet_run)
+    assert mesh.n_cells > n_res, (
+        "sheet must include arrowhead triangles beyond the per-residue quads"
+    )
+
+
+def test_ribbon_handles_1aki_end_to_end():
+    """Smoke test: build a full ribbon for 1aki and ensure no crash,
+    non-empty mesh, and secondary colors are present."""
+    mol = load_pdb(EXAMPLES / "1aki.pdb")
+    mesh = ribbon(mol, scheme=SCHEME_PRESETS["secondary"])
+    assert mesh.n_cells > 100
+    colors = mesh.cell_data["colors"]
+    # We expect at least 3 distinct colors (helix, sheet, loop)
+    unique = {tuple(c) for c in colors}
+    assert len(unique) >= 3

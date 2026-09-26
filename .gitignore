@@ -6,3 +6,7 @@ __pycache__/
 out/
 screenshot.png
 *.egg-info/
+examples/Bosutinib_docked.pdbqt
+examples/src_protein.pdb
+screenshot*.png
+3Dmol.js-master.zip.crdownload

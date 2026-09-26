@@ -110,17 +110,33 @@ class ViewportWidget(QWidget):
 
     # ----------------------------------------------------------- public ops
     def refresh(self) -> None:
-        """Re-render every visible scene object."""
-        if not hasattr(self, "plotter") or not hasattr(self.plotter, "clear"):
+        """Re-render every visible scene object.
+
+        PyVistaQt on macOS corrupts actor state after `clear()` then
+        re-adding many actors — the LAST actor (and sometimes the
+        second-to-last) loses colors. We avoid `clear()` entirely and
+        instead remove only the actors we previously added, leaving
+        the render window and lighting intact.
+        """
+        if not hasattr(self, "plotter") or not hasattr(self.plotter, "actors"):
             return
-        try:
-            self.plotter.clear()
-        except Exception:
-            return
-        # CRITICAL: `plotter.clear()` also removes lights and SSAO.
-        # Re-install the lighting rig and SSAO every refresh, otherwise
-        # the first render looks lit but every subsequent refresh goes
-        # completely flat (no Phong shading, no shadow contact).
+        # Drop our previously-rendered actors only — leave axes, lights,
+        # camera, scalar bar untouched.
+        owned_bases = {o.name for o in self.scene.objects}
+        if hasattr(self.plotter, "actors"):
+            for actor_name in list(self.plotter.actors.keys()):
+                # We only own actors whose names are scene object names
+                # or our `name:atoms` / `name:bonds` sub-names. When the
+                # scene is empty, remove ALL of them; otherwise only
+                # remove actors whose base is no longer in the scene.
+                base = actor_name.split(":", 1)[0]
+                if not owned_bases or base not in owned_bases:
+                    try:
+                        self.plotter.remove_actor(actor_name)
+                    except Exception:
+                        pass
+        # Re-install lights / SSAO only if they were lost (cheap to do
+        # every time; RemoveAllLights() is idempotent on a clean state).
         if hasattr(self.plotter, "enable_ssao"):
             try:
                 self.plotter.enable_ssao(radius=1.5, bias=0.02, kernel_size=64)
@@ -251,15 +267,102 @@ class ViewportWidget(QWidget):
         def _add_one(sub, name: str) -> None:
             if sub is None:
                 return
-            # PyVista 0.49's add_mesh() defaults to point_data when
-            # looking up scalars. Our meshes keep the color array on
-            # *cell_data*, so without `preference='cell'` the renderer
-            # silently falls back to a white default. Detect which side
-            # the colors live on and pin the preference accordingly.
-            has_cell   = "colors" in (sub.cell_data.keys() or [])
-            has_point  = "colors" in (sub.point_data.keys() or [])
-            scalars = "colors" if (has_cell or has_point) else None
+            # Skip zero-point meshes entirely. PyVista raises ValueError
+            # for them and that exception seems to leave the plotter in
+            # a bad state — subsequent actors (e.g. the protein loaded
+            # right after a docking pose) come out colorless because the
+            # shared mapper/LUT machinery never finishes initializing.
+            if sub.n_points == 0 and sub.n_cells == 0:
+                return
+            print(
+                f"[viewport] _add_one ENTER name={name!r} "
+                f"cell_data={list(sub.cell_data.keys())} "
+                f"point_data={list(sub.point_data.keys())} "
+                f"n_pts={sub.n_points} n_cells={sub.n_cells}",
+                flush=True,
+            )
+            # IMPORTANT: rename the colors array to be unique per actor.
+            # Multiple meshes sharing `cell_data["colors"]` trigger a
+            # PyVistaQt / macOS OpenGL bug where the second mesh reuses
+            # the first actor's mapper state — colors get lost. A unique
+            # scalar name (e.g. `colors_1aki`, `colors_pose_1_xxx_atoms`)
+            # forces each actor to build its own mapper pipeline.
+            sub = sub.copy(deep=False)
+            base = name.replace(":", "_")
+            new_scalar = f"colors_{base}"
+            cell_colors = None
+            point_colors = None
+            if "colors" in (sub.cell_data.keys() or []):
+                cell_colors = sub.cell_data["colors"].copy()
+                del sub.cell_data["colors"]
+            if "colors" in (sub.point_data.keys() or []):
+                point_colors = sub.point_data["colors"].copy()
+                del sub.point_data["colors"]
+            # PyVistaQt on macOS has a bug where `preference="cell"` is
+            # silently ignored on the second (and later) actors added
+            # after a `clear()`, so colors come out as default white.
+            # Workaround: copy the cell colors into point_data so the
+            # default point-data lookup picks them up.
+            if cell_colors is not None and point_colors is None:
+                # Cell colors → broadcast onto points. PyVista requires
+                # point_data arrays to match n_points; for tube meshes
+                # we have multiple points per cell, so assign each
+                # point the color of the cell whose centroid is nearest.
+                # Naive broadcasting is O(n_points × n_cells) memory
+                # (e.g. 200k × 20k ≈ 96 GB) and OOMs on real proteins,
+                # so we use a KDTree for large meshes and einsum only
+                # for small ones.
+                import numpy as _np
+                try:
+                    if sub.n_cells == 0 or sub.n_points == 0:
+                        raise ValueError("empty")
+                    centers = sub.cell_centers().points
+                    pts = sub.points
+                    n_pts, n_cells = pts.shape[0], centers.shape[0]
+                    # Threshold: ~5k cells × 5k pts = ~200 MB broadcast.
+                    if n_pts * n_cells <= 25_000_000:
+                        diffs = pts[:, None, :] - centers[None, :, :]
+                        d2 = _np.einsum("ijk,ijk->ij", diffs, diffs)
+                        nearest = _np.argmin(d2, axis=1)
+                    else:
+                        from scipy.spatial import cKDTree
+                        _, nearest = cKDTree(centers).query(pts, k=1)
+                    point_colors = cell_colors[nearest]
+                except Exception:
+                    point_colors = None
+            if point_colors is not None:
+                sub.point_data[new_scalar] = point_colors
+                # Make the renamed scalar the *active* array — otherwise
+                # PyVista's add_mesh may pick `vtkOriginalPointIds` /
+                # `vtkOriginalCellIds` (added by extract_surface) as the
+                # active scalar and silently drop our colors.
+                try:
+                    sub.set_active_scalars(new_scalar, preference="point")
+                except Exception:
+                    pass
+                # Drop the leftover tube-filter bookkeeping arrays that
+                # confuse add_mesh's default scalar lookup.
+                for stale in ("vtkOriginalCellIds", "vtkOriginalPointIds",
+                              "TubeNormals", "Normals", "GlyphVector"):
+                    if stale in sub.cell_data.keys():
+                        del sub.cell_data[stale]
+                    if stale in sub.point_data.keys():
+                        del sub.point_data[stale]
+            has_cell   = new_scalar in (sub.cell_data.keys() or [])
+            has_point  = new_scalar in (sub.point_data.keys() or [])
+            scalars = new_scalar if (has_cell or has_point) else None
             preference = "cell" if has_cell else ("point" if has_point else "point")
+            # Diagnostic: warn when a mesh with NO colors reaches the
+            # plotter — that's almost always the bug.
+            if scalars is None and sub.n_points > 0:
+                print(
+                    f"[viewport] {name!r} (rep={obj.representation}): mesh "
+                    f"has NO colors (cell_data={list(sub.cell_data.keys())}, "
+                    f"point_data={list(sub.point_data.keys())}, "
+                    f"n_points={sub.n_points}, n_cells={sub.n_cells}); "
+                    f"rendering as default white.",
+                    flush=True,
+                )
             kwargs = dict(
                 name=name,
                 color=None,
@@ -296,22 +399,78 @@ class ViewportWidget(QWidget):
                               "ambient", "diffuse", "pbr", "metallic", "roughness")},
             ]
             last_exc: Exception | None = None
-            for attempt_kwargs in attempts:
+            attempt_log: list[str] = []
+            for attempt_idx, attempt_kwargs in enumerate(attempts):
                 try:
                     self.plotter.add_mesh(sub, **attempt_kwargs)
                     last_exc = None
+                    if attempt_idx > 0:
+                        dropped = set(attempts[0].keys()) - set(attempt_kwargs.keys())
+                        print(
+                            f"[viewport] {name!r} (rep={obj.representation}): "
+                            f"add_mesh needed fallback #{attempt_idx+1}, "
+                            f"dropped={sorted(dropped)}",
+                            flush=True,
+                        )
                     break
                 except Exception as exc:
                     last_exc = exc
+                    attempt_log.append(f"#{attempt_idx+1} {type(exc).__name__}: {exc}")
+            # Workaround for PyVistaQt / macOS OpenGL bug: when an actor
+            # is added after many others, its mapper's lookup table is
+            # shared/corrupted and colors render as white. We bypass
+            # the broken PyVista mapper and install a fresh
+            # vtkDataSetMapper with a brand-new vtkLookupTable.
+            if last_exc is None and scalars is not None:
+                try:
+                    actor = self.plotter.actors.get(name)
+                    if actor is not None:
+                        import vtk
+                        new_mapper = vtk.vtkDataSetMapper()
+                        new_mapper.SetInputData(sub)
+                        new_mapper.SelectColorArray(scalars)
+                        if "cell" in preference:
+                            new_mapper.SetScalarModeToUseCellData()
+                        else:
+                            new_mapper.SetScalarModeToUsePointData()
+                        new_mapper.SetScalarVisibility(True)
+                        # Build a brand-new, isolated lookup table per
+                        # actor so no state can leak between actors.
+                        new_lut = vtk.vtkLookupTable()
+                        new_lut.SetNumberOfTableValues(256)
+                        new_lut.Build()
+                        new_mapper.SetLookupTable(new_lut)
+                        actor.SetMapper(new_mapper)
+                except Exception as exc:
+                    print(
+                        f"[viewport] mapper-replacement for {name!r} failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+            # Diagnostic: log every actor we tried to add so we can see
+            # whether the protein's add_mesh succeeded or fell through.
+            print(
+                f"[viewport] {name!r} (rep={obj.representation}): "
+                f"scalars={scalars!r}, preference={preference!r}, "
+                f"n_points={sub.n_points}, n_cells={sub.n_cells}, "
+                f"cell_data={list(sub.cell_data.keys())}, "
+                f"succeeded={last_exc is None}",
+                flush=True,
+            )
             if last_exc is not None:
                 print(
                     f"[viewport] add_mesh failed for {name!r} "
-                    f"(rep={obj.representation}): "
-                    f"{type(last_exc).__name__}: {last_exc}",
+                    f"(rep={obj.representation}) after {len(attempts)} attempts: "
+                    f"{'; '.join(attempt_log)}",
                     flush=True,
                 )
                 try:
                     self.plotter.add_mesh(sub, name=name, color="#cccccc")
+                    print(
+                        f"[viewport] {name!r}: rendered as gray fallback "
+                        f"(NO COLORS!) — investigate real cause.",
+                        flush=True,
+                    )
                 except Exception as exc2:
                     print(
                         f"[viewport] fallback add_mesh also failed for {name!r}: "
@@ -341,7 +500,9 @@ class ViewportWidget(QWidget):
         return ""
 
     # ----------------------------------------------------------- misc
-    def wheelEvent(self, event) -> None:  # noqa: N802
-        # PyVista handles camera zoom via its own event filters; keep this
-        # empty so the OS doesn't scroll the parent widget.
-        event.accept()
+    # NOTE: do NOT override wheelEvent. PyVista's QtInteractor is a
+    # child widget that handles zoom via its own event filters; if we
+    # accept the event here, the plotter never sees it and zoom stops
+    # working. Earlier we set `event.accept()` to prevent the outer
+    # scroll area from scrolling — the splitter we sit in does not
+    # actually need that protection.

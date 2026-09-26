@@ -346,14 +346,12 @@ class StudioAPI:
     # ----------------------------------------------------------- rendering
     def refresh(self) -> None:
         """Re-render every object in the scene."""
+        from .core.representations import build_mesh
         self.viewport.clear()
         for obj in self.scene.objects:
             if not obj.visible:
                 continue
-            renderer = REPRESENTATIONS[obj.representation]
-            mesh = renderer(obj.molecule, scheme=obj.color_scheme)
-            # Apply object transform
-            mesh = self._apply_transform(mesh, obj)
+            mesh = build_mesh(obj, obj.color_scheme)
             self.viewport.add(obj.name, mesh)
         self._dirty = False
 

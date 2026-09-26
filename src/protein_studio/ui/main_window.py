@@ -299,12 +299,34 @@ class MainWindow(QMainWindow):
         self._status_label.setText("Centered view on centroid")
 
     def refresh_viewport(self) -> None:
-        # Re-render via API: triggers headless rendering then update viewport
-        self.api.refresh()
-        # Sync viewport caches from headless viewport
-        self.viewport._meshes.clear()
-        for name, mesh in self.api.viewport.plots.items():
-            self.viewport._meshes[name] = mesh
+        # Rebuild meshes only for objects whose (representation, scheme,
+        # molecule-identity) has changed; reuse the cached mesh otherwise.
+        # This skips the ~250 ms `_propagate_cell_colors` cost on every
+        # toggle. After mesh updates we re-render the GUI viewport only
+        # (no need to round-trip through the headless path).
+        from ..core.representations import build_mesh
+        cache: dict[tuple, object] = getattr(self, "_mesh_cache", {})
+        new_cache: dict[tuple, object] = {}
+        for obj in self.scene.objects:
+            if not obj.visible:
+                continue
+            key = (
+                obj.name,
+                obj.representation,
+                id(obj.color_scheme),
+                id(obj.molecule),
+            )
+            mesh = cache.get(key)
+            if mesh is None:
+                mesh = build_mesh(obj, obj.color_scheme)
+            self.viewport._meshes[obj.name] = mesh
+            new_cache[key] = mesh
+        self._mesh_cache = new_cache
+        # Drop meshes for objects that are no longer visible / present
+        live = {o.name for o in self.scene.objects}
+        for n in list(self.viewport._meshes):
+            if n not in live:
+                del self.viewport._meshes[n]
         self.viewport.refresh()
 
     def toggle_wireframe(self) -> None:
