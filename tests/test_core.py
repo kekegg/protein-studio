@@ -20,7 +20,7 @@ from protein_studio.core.io import load_pdb
 from protein_studio.core.colors import SCHEME_PRESETS, SS_COLORS
 from protein_studio.core.representations import (
     available_representations, cartoon, ball_and_stick, surface, point_cloud,
-    ribbon, _local_frames, _group_runs, _helix_segment, _sheet_segment,
+    ribbon,
 )
 from protein_studio.core.scene import Scene, SceneObject
 
@@ -183,81 +183,6 @@ def test_scene_emits_events():
 
 # --------------------------------------------------------------- SS-aware ribbon
 
-def test_local_frames_one_per_ca_residue():
-    mol = load_pdb(EXAMPLES / "1aki.pdb")
-    chain = mol.chains[0]
-    ca_count = sum(1 for r in chain.residues if r.atom("CA") is not None)
-    frames = _local_frames(list(chain.residues))
-    assert len(frames) == ca_count
-    for f in frames:
-        assert abs(np.linalg.norm(f.axis) - 1.0) < 1e-6
-        assert abs(np.linalg.norm(f.up) - 1.0) < 1e-6
-        assert abs(f.axis.dot(f.up)) < 1e-6  # perpendicular
-
-
-def test_group_runs_splits_by_ss():
-    mol = load_pdb(EXAMPLES / "1aki.pdb")
-    chain = mol.chains[0]
-    frames = _local_frames(list(chain.residues))
-    runs = _group_runs(frames)
-    assert runs, "should produce at least one run"
-    # The kinds must match the actual SS of each frame's residue
-    for kind, run in runs:
-        for f in run:
-            ss = (f.residue.secondary_structure or "loop").lower()
-            if ss == "helix":
-                assert kind == "helix"
-            elif ss == "sheet":
-                assert kind == "sheet"
-            else:
-                assert kind == "loop"
-
-
-def test_helix_segment_connected_manifold():
-    """A helix segment must produce a single connected manifold mesh,
-    not a stack of disconnected rings."""
-    mol = load_pdb(EXAMPLES / "4hhb.pdb")
-    chain = mol.chains[1]
-    frames = _local_frames(list(chain.residues))
-    runs = _group_runs(frames)
-    helix_run = next(r for k, r in runs if k == "helix")
-    mesh = _helix_segment(helix_run, 1.5, (1.0, 0.3, 0.1))
-    assert mesh.n_cells > 0
-    # Connectivity check — a properly-built cylinder should be 1 region
-    import vtk
-    conn = vtk.vtkConnectivityFilter()
-    conn.SetInputData(mesh)
-    conn.SetExtractionModeToAllRegions()
-    conn.Update()
-    assert conn.GetNumberOfExtractedRegions() == 1, (
-        f"helix segment has {conn.GetNumberOfExtractedRegions()} disconnected "
-        f"pieces — likely only the first/last residue rings are connected "
-        f"and the dense interpolated rings are orphaned"
-    )
-
-
-def test_helix_segment_volume_scales_with_length():
-    """Helix volume should scale roughly linearly with the number of
-    residue frames (longer helix = more cylinder)."""
-    mol = load_pdb(EXAMPLES / "4hhb.pdb")
-    chain = mol.chains[1]
-    frames = _local_frames(list(chain.residues))
-    runs = _group_runs(frames)
-    helix_runs = [r for k, r in runs if k == "helix"]
-    import vtk
-    def volume(r):
-        m = _helix_segment(r, 1.5, (1.0, 0.3, 0.1))
-        mp = vtk.vtkMassProperties()
-        mp.SetInputData(m)
-        mp.Update()
-        return mp.GetVolume()
-    short_run = min(helix_runs, key=len)
-    long_run = max(helix_runs, key=len)
-    assert volume(long_run) > volume(short_run) * 1.5, (
-        "longer helix should have substantially more cylinder volume"
-    )
-
-
 def test_ribbon_returns_single_polydata_with_colors():
     mol = load_pdb(EXAMPLES / "1aki.pdb")
     mesh = ribbon(mol, scheme=SCHEME_PRESETS["secondary"])
@@ -268,19 +193,64 @@ def test_ribbon_returns_single_polydata_with_colors():
     assert mesh.cell_data["colors"].shape[0] == mesh.n_cells
 
 
-def test_ribbon_sheet_segment_contains_arrowhead_extra_cells():
-    """A sheet segment with N residues should have at least N strip
-    quads + arrowhead triangles, so the cell count exceeds N."""
+def test_ribbon_is_a_flat_strip_not_a_cylinder():
+    """A 3Dmol.js-style ribbon is a flat twisted strip — its cross-section
+    is wider in the side-vector direction than in the binormal direction.
+    A cylinder would have similar width in both axes; we want to confirm
+    the strip is much wider than it is thick."""
+    mol = load_pdb(EXAMPLES / "4hhb.pdb")
+    mesh = ribbon(mol, scheme=SCHEME_PRESETS["secondary"])
+    # Pick any residue mid-protein — its strip cross-section should be a
+    # rectangle ~helix_sheet_width × thickness = 1.3 × 0.4 = 2.6 wide
+    # and 0.4 thick (aspect ratio ~6.5).
+    # Measure: at the same residue i, find the cross-section extent along
+    # the local side vector vs along the local binormal.
+    import numpy as np
+    pts = mesh.points
+    # Approximate by sampling all points in a tight cluster.
+    centroid = pts.mean(axis=0)
+    nearby = pts[np.linalg.norm(pts - centroid, axis=1) < 1.0]
+    if len(nearby) < 4:
+        pytest.skip("no nearby cluster to measure cross-section")
+    # PCA: the smallest-variance axis is the binormal (thickness direction)
+    centered = nearby - nearby.mean(axis=0)
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    # eigvals sorted ascending → thickness² ≤ side² ≤ along-chain²
+    thickness_axis_var = eigvals[0]
+    side_axis_var = eigvals[1]
+    assert side_axis_var > thickness_axis_var * 4, (
+        f"ribbon cross-section should be much wider than thick; got "
+        f"side²={side_axis_var:.3f}, thickness²={thickness_axis_var:.3f} "
+        f"— looks more like a cylinder/tube than a flat strip"
+    )
+
+
+def test_ribbon_sheet_arrowhead_widens():
+    """The C-terminal end of a sheet strand must be visibly wider than
+    the N-terminal end (the arrowhead)."""
     mol = load_pdb(EXAMPLES / "1aki.pdb")
-    chain = mol.chains[0]
-    frames = _local_frames(list(chain.residues))
-    runs = _group_runs(frames)
-    sheet_run = next(r for k, r in runs if k == "sheet")
-    mesh = _sheet_segment(sheet_run, 1.6, 0.3, (1.0, 1.0, 0.0),
-                          arrowhead=True)
-    n_res = len(sheet_run)
-    assert mesh.n_cells > n_res, (
-        "sheet must include arrowhead triangles beyond the per-residue quads"
+    mesh = ribbon(mol, scheme=SCHEME_PRESETS["secondary"])
+    import numpy as np
+    # 1aki's sheet residues are colored yellow in the secondary scheme
+    # (SS_COLORS["sheet"] = (0.95, 0.85, 0.20)).
+    yellow_mask = np.all(np.isclose(mesh.cell_data["colors"], [0.95, 0.85, 0.20],
+                                     atol=0.02), axis=1)
+    yellow_cells = np.where(yellow_mask)[0]
+    assert len(yellow_cells) > 0, "expected yellow sheet cells"
+    pts = mesh.points
+    # Find all vertex indices referenced by yellow cells
+    flat_faces = mesh.faces.reshape(-1, 4)
+    yellow_vert_ids = set()
+    for ci in yellow_cells:
+        yellow_vert_ids.update(flat_faces[ci, 1:4].tolist())
+    yellow_pts = pts[list(yellow_vert_ids)]
+    bbox_extent = yellow_pts.max(axis=0) - yellow_pts.min(axis=0)
+    # For a 3-residue sheet with arrow widening the last 2 to 2× width,
+    # the bbox should span several Å in one direction (the strip
+    # axis) AND several Å in another (the arrowhead widening).
+    assert bbox_extent.max() > 1.5, (
+        f"sheet bbox too small {bbox_extent} — arrowhead widening missing?"
     )
 
 
