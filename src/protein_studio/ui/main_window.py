@@ -36,7 +36,7 @@ from .properties import PropertiesWidget
 from .viewport import ViewportWidget
 
 
-APP_NAME = "Protein Studio"
+APP_NAME = "LingSu Protein"
 APP_VERSION = "0.1.0"
 
 
@@ -56,6 +56,15 @@ class MainWindow(QMainWindow):
         self.api = api
 
         self.setWindowTitle(APP_NAME)
+        # Use the bundled icon (also set on QApplication, but having it
+        # on the window too means alt-tab and screenshots pick it up).
+        try:
+            from ..resources import load_app_icon
+            ic = load_app_icon()
+            if not ic.isNull():
+                self.setWindowIcon(ic)
+        except Exception:
+            pass
         self.resize(1280, 800)
         self.setStyleSheet(
             "QMainWindow { background: #2d2d2d; }"

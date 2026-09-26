@@ -37,6 +37,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     from .api import StudioAPI, HeadlessViewport
     from .core.scene import Scene
+    from .resources import load_app_icon
     from .ui.viewport import ViewportWidget
     from .ui.outliner import OutlinerWidget
     from .ui.properties import PropertiesWidget
@@ -45,6 +46,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Dark palette (Blender-like)
     app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("LingSu Protein")
+    app.setApplicationDisplayName("LingSu Protein")
+    # The window icon doubles as the macOS dock icon when running
+    # without an .app bundle (which is the common case during
+    # development). When packaged inside an .app bundle, the
+    # CFBundleIconFile takes precedence.
+    app_icon = load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     app.setStyle("Fusion")
     palette = app.palette()
     palette.setColor(QPalette.ColorRole.Window, QColor(45, 45, 45))
