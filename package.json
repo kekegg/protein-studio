@@ -6,6 +6,7 @@
   "workspaces": ["docs"],
   "scripts": {
     "docs:build": "npm run build --workspace=docs",
-    "mcp:register": "node scripts/register-mcp.mjs all"
+    "mcp:register": "node scripts/register-mcp.mjs",
+    "mcp:print":   "node scripts/register-mcp.mjs --print"
   }
 }
