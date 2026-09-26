@@ -283,17 +283,36 @@ class MainWindow(QMainWindow):
         self._mcp_stop_action.setEnabled(state == "running")
 
     def closeEvent(self, event) -> None:
-        """Stop the spin timer and the MCP subprocess on window close
-        so nothing leaks into the next session."""
+        """Shut down every long-lived subsystem on window close.
+
+        Order matters: VTK first, then the MCP thread ("generator"),
+        then super() so Qt can tear down the QOpenGLWidget normally.
+
+        Without this ordering, ``vtkOrientationMarkerWidget`` (held by
+        PyVista's ``add_axes``) survives past the QOpenGLWidget destroy
+        pass; on the next GC tick it calls ``EnabledOff`` →
+        ``ReleaseGraphicsResources`` → ``glDeleteBuffers`` against a
+        dead GL context and segfaults. The MCP controller uses a
+        background ``threading.Thread`` driving asyncio.run; if it
+        outlives the QApplication, its uvicorn loop tries to use
+        already-freed VTK state on shutdown too.
+        """
+        # 1. Tear down the OpenGL scene first — plotter.close() while
+        #    the QOpenGLWidget is still alive, so VTK can release its
+        #    GL buffers cleanly.
         try:
-            self.viewport.stop_spin()
+            self.viewport.shutdown()
         except Exception:
             pass
+        # 2. Stop the MCP HTTP server / event loop / thread.
         try:
-            if self._mcp.is_running() or self._mcp.state == "starting":
+            if (self._mcp.is_running()
+                    or self._mcp.state == "starting"
+                    or self._mcp.state == "stopping"):
                 self._mcp.stop()
         except Exception:
             pass
+        # 3. Let Qt tear down widgets.
         super().closeEvent(event)
 
     def _build_central(self) -> None:

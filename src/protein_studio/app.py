@@ -101,6 +101,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                              api)
     main_window.show()
 
+    # Belt-and-suspenders shutdown: even if closeEvent is bypassed
+    # (e.g. ``app.quit()`` from the Python REPL), make sure the VTK
+    # plotter is torn down before QApplication starts destroying
+    # QOpenGLWidgets. ``aboutToQuit`` fires once per process exit, just
+    # before the event loop stops accepting events.
+    def _safe_vtk_shutdown():
+        try:
+            viewport_widget.shutdown()
+        except Exception:
+            pass
+    app.aboutToQuit.connect(_safe_vtk_shutdown)
+
     # Open any PDB files passed on the command line
     pdb_paths = list(args.pdb or [])
     # If none passed, auto-load examples/1aki.pdb so the user has

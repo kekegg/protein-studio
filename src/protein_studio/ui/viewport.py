@@ -258,6 +258,59 @@ class ViewportWidget(QWidget):
         self._spin_timer = None
         self._spinning = False
 
+    # ----------------------------------------------------------- shutdown
+    def shutdown(self) -> None:
+        """Synchronously tear down the OpenGL scene.
+
+        Called from ``MainWindow.closeEvent`` *before* the MCP thread
+        or any other coroutine is asked to exit. VTK holds onto an
+        ``vtkOrientationMarkerWidget`` (created by ``add_axes``) plus
+        per-actor buffer objects; if those survive until the
+        QOpenGLWidget is destroyed by Qt, ``EnabledOff`` /
+        ``ReleaseGraphicsResources`` can run on a dead GL context and
+        segfault inside ``glDeleteBuffers``.
+
+        We close the plotter explicitly, in order:
+
+        1. Stop the spin timer (it pokes the render window).
+        2. Hide the plotter widget — Qt stops scheduling paints.
+        3. Call ``plotter.close()`` — PyVistaQt's hook that removes
+           the orientation marker, clears lights, and finalises the
+           render window while the GL context is still alive.
+        4. Break our own reference cycle so the next GC pass doesn't
+           try to use the (now-dead) plotter.
+        """
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        try:
+            self.stop_spin()
+        except Exception:
+            pass
+        plotter = getattr(self, "plotter", None)
+        if plotter is not None:
+            try:
+                if hasattr(plotter, "hide"):
+                    plotter.hide()
+            except Exception:
+                pass
+            try:
+                from PySide6.QtWidgets import QApplication
+                QApplication.processEvents()
+            except Exception:
+                pass
+            try:
+                if hasattr(plotter, "close"):
+                    plotter.close()
+            except Exception:
+                pass
+        try:
+            if plotter is not None and hasattr(plotter, "deleteLater"):
+                plotter.deleteLater()
+        except Exception:
+            pass
+        self.plotter = None  # type: ignore[assignment]
+
     def toggle_spin(self) -> bool:
         """Toggle spin on/off. Returns the new state (``True`` = spinning)."""
         if getattr(self, "_spinning", False):
