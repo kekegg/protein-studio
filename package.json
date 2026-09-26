@@ -1,0 +1,11 @@
+{
+  "name": "protein-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LingSu Protein — desktop molecular visualization",
+  "workspaces": ["docs"],
+  "scripts": {
+    "docs:build": "npm run build --workspace=docs",
+    "mcp:register": "node scripts/register-mcp.mjs all"
+  }
+}
