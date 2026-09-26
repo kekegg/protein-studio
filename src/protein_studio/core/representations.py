@@ -765,7 +765,8 @@ def ribbon(
     helix_sheet_width: float = 1.3,
     coil_width: float = 0.5,
     thickness: float = 0.4,
-    quality: int = 8,
+    quality: int = 12,
+    chain_subdiv: int = 4,
 ) -> "object":
     """SS-aware ribbon: a flat twisted strip following the chain.
 
@@ -773,11 +774,16 @@ def ribbon(
     residue, ``quality`` cross-section points are laid out perpendicular
     to the chain direction spanning a width of ``helix_sheet_width``
     (for helix/sheet) or ``coil_width`` (for coil). The strip is then
-    triangulated between consecutive residues, parallel-transported to
+    triangulated between consecutive samples, parallel-transported to
     avoid twist, and extruded slightly along the binormal so it has
     volume and catches Phong shading. Beta-sheet strands widen at the
-    C-terminal end into an arrowhead by adding a parallel "arrow"
-    cross-section row at twice the regular width at the last residue.
+    C-terminal end into an arrowhead.
+
+    For smoothness the backbone is also subdivided along the chain
+    direction with a Catmull-Rom-like interpolation, producing
+    ``chain_subdiv`` samples per residue interval. The end result is
+    a ribbon with roughly ``quality * chain_subdiv * n_residues``
+    vertices, smooth enough to look like a continuous twisting strip.
 
     Result: the protein backbone is rendered as a single continuous
     ribbon that twists naturally with the chain — never as a uniform
@@ -785,7 +791,7 @@ def ribbon(
     """
     pv = _safe_import_pyvista()
     scheme = scheme or ColorScheme("secondary", "secondary")
-    num_cross = quality  # number of points across the ribbon width
+    num_cross = quality
 
     chain_meshes: List[Any] = []
     for chain in mol.chains:
@@ -840,6 +846,14 @@ def ribbon(
             sides[i] = side / nrm
             prev_side = sides[i]
 
+        # Binormal = side × tangent (perpendicular to both, gives the
+        # direction along which we extrude for thickness).
+        binormals = np.cross(sides, tangents)
+        for i in range(n):
+            nrm = np.linalg.norm(binormals[i])
+            binormals[i] = binormals[i] / nrm if nrm > 1e-9 \
+                else np.array([0.0, 0.0, 1.0])
+
         # Width per residue (helix/sheet wide, coil narrow)
         widths = np.array([
             helix_sheet_width if ss in ("helix", "sheet") else coil_width
@@ -855,91 +869,130 @@ def ribbon(
                 continue
             nxt = ss_list[k + 1] if k + 1 < n else "loop"
             if nxt != "sheet":
-                # End of a sheet run: mark last two residues (or last
-                # one if the run has just one residue).
                 arrow_residue_idx.add(k)
                 if k > 0 and ss_list[k - 1] == "sheet":
                     arrow_residue_idx.add(k - 1)
 
-        # Binormal = side × tangent (perpendicular to both, gives the
-        # direction along which we extrude for thickness).
-        binormals = np.cross(sides, tangents)
-        for i in range(n):
-            nrm = np.linalg.norm(binormals[i])
-            binormals[i] = binormals[i] / nrm if nrm > 1e-9 \
-                else np.array([0.0, 0.0, 1.0])
+        # Subdivide along the chain to smooth the ribbon. We insert
+        # (chain_subdiv - 1) extra samples between every pair of
+        # adjacent residues, interpolating position, tangent, side,
+        # binormal, and width via spherical-linear / linear blends.
+        if chain_subdiv > 1 and n >= 2:
+            new_pos = [positions[0]]
+            new_tan = [tangents[0]]
+            new_side = [sides[0]]
+            new_bin = [binormals[0]]
+            new_w = [widths[0]]
+            new_ss_idx = [0]  # which residue each sample's color comes from
+            for i in range(n - 1):
+                p1, p2 = positions[i], positions[i + 1]
+                t1, t2 = tangents[i], tangents[i + 1]
+                s1, s2 = sides[i], sides[i + 1]
+                b1, b2 = binormals[i], binormals[i + 1]
+                w1, w2 = widths[i], widths[i + 1]
+                for k in range(1, chain_subdiv):
+                    u = k / chain_subdiv
+                    new_pos.append((1 - u) * p1 + u * p2)
+                    new_tan.append(_slerp_unit(t1, t2, u))
+                    new_side.append(_slerp_unit(s1, s2, u))
+                    # binormal recomputed from the new side × tangent
+                    bnew = np.cross(new_side[-1], new_tan[-1])
+                    bnrm = np.linalg.norm(bnew)
+                    new_bin.append(bnew / bnrm if bnrm > 1e-9
+                                    else np.array([0.0, 0.0, 1.0]))
+                    new_w.append((1 - u) * w1 + u * w2)
+                    # Color comes from the closer residue for visual
+                    # fidelity when crossing an SS boundary.
+                    new_ss_idx.append(i if u < 0.5 else i + 1)
+                new_pos.append(p2)
+                new_tan.append(t2)
+                new_side.append(s2)
+                new_bin.append(b2)
+                new_w.append(w2)
+                new_ss_idx.append(i + 1)
+            positions = np.array(new_pos)
+            tangents = np.array(new_tan)
+            sides = np.array(new_side)
+            binormals = np.array(new_bin)
+            widths = np.array(new_w)
+            n = len(positions)
+
+        # Apply arrow widening to the last 2 residues (in *original*
+        # residue space — the last 2 of the subdivided grid are at
+        # the very C-end). We use the original residue index for arrow
+        # detection.
+        # Build a per-sample SS list in original-residue terms
+        per_sample_orig = []
+        for k in range(n):
+            i_orig = min(new_ss_idx[k] if chain_subdiv > 1 else k, len(ss_list) - 1)
+            per_sample_orig.append(i_orig)
+
+        # Mark the C-end of each sheet strand: any sample whose next
+        # sample is not a sheet. Apply 2× width to last 2 samples.
+        arrow_samples: set[int] = set()
+        for k in range(n):
+            i_orig = per_sample_orig[k]
+            if ss_list[i_orig] != "sheet":
+                continue
+            nxt_orig = ss_list[i_orig + 1] if i_orig + 1 < len(ss_list) else "loop"
+            if nxt_orig != "sheet":
+                arrow_samples.add(k)
+                if k > 0 and per_sample_orig[k - 1] == i_orig:
+                    arrow_samples.add(k - 1)
+        eff_widths = widths.copy()
+        for k in arrow_samples:
+            eff_widths[k] *= 2.0
 
         # Build the 2D grid of strip vertices: pts[cross, length].
-        # pts[j, i] = position[i] + delta_j * width[i] * side[i]
-        #             ± thickness/2 * binormal[i]
-        # We extrude both "above" and "below" the ribbon plane so it
-        # has visible volume.
+        # pts[j, k] = position[k] + delta_j * eff_widths[k] * side[k]
         pts = np.zeros((num_cross, n, 3))
-        for i in range(n):
-            w = widths[i]
-            if i in arrow_residue_idx:
-                w *= 2.0  # widen the strip at the arrowhead
+        for k in range(n):
+            w = eff_widths[k]
             for j in range(num_cross):
                 delta = -1.0 + j * 2.0 / (num_cross - 1)
-                pts[j, i] = (positions[i]
-                              + delta * w * sides[i]
-                              + (0.5 - delta * 0.0) * 0.0)  # flat sheet
-        # Flatten the top & bottom extrusion: simply duplicate every
-        # cross-section vertex with ±thickness/2 along the binormal.
-        # Build a 2*num_cross x n grid (top + bottom).
+                pts[j, k] = positions[k] + delta * w * sides[k]
+        # Flatten the top & bottom extrusion: ±thickness/2 along binormal
         full = np.zeros((num_cross * 2, n, 3))
-        for i in range(n):
+        for k in range(n):
             for j in range(num_cross):
-                p = pts[j, i]
-                full[j, i] = p + binormals[i] * thickness * 0.5
-                full[j + num_cross, i] = p - binormals[i] * thickness * 0.5
+                p = pts[j, k]
+                full[j, k] = p + binormals[k] * thickness * 0.5
+                full[j + num_cross, k] = p - binormals[k] * thickness * 0.5
 
-        # Per-vertex color (one color per residue, smoothed)
+        # Per-vertex color (one color per residue, interpolated)
         cols = np.zeros((full.shape[0], n, 3))
-        for i in range(n):
-            c = scheme.color(backbone[i])
+        for k in range(n):
+            i_orig = per_sample_orig[k]
+            c = scheme.color(backbone[i_orig])
             for j in range(full.shape[0]):
-                cols[j, i] = c
+                cols[j, k] = c
 
         # Build the strip mesh: triangles connecting consecutive
-        # cross-section vertices across consecutive residues, plus
-        # side strips closing the top and bottom edges of the ribbon.
+        # cross-section vertices across consecutive samples.
         verts_list = []
         faces_list = []
-        # Index helper: vertex index in the flat array
-        def vid(jc: int, i: int) -> int:
-            return jc * n + i
+        def vid(jc: int, k: int) -> int:
+            return jc * n + k
 
-        # Flatten verts to a (V, 3) array
         for jc in range(full.shape[0]):
-            for i in range(n):
-                verts_list.append(full[jc, i])
-        # Triangles between cross-section row jc and jc+1 (lateral)
+            for k in range(n):
+                verts_list.append(full[jc, k])
+        # Lateral quads (between jc and jc+1, samples k and k+1)
         for jc in range(full.shape[0] - 1):
-            for i in range(n - 1):
-                a = vid(jc, i)
-                b = vid(jc + 1, i)
-                c = vid(jc + 1, i + 1)
-                d = vid(jc, i + 1)
+            for k in range(n - 1):
+                a = vid(jc, k)
+                b = vid(jc + 1, k)
+                c = vid(jc + 1, k + 1)
+                d = vid(jc, k + 1)
                 faces_list.append([3, a, b, c])
                 faces_list.append([3, a, c, d])
-        # Close the chain ends with end-caps (triangle fans)
-        for jc in range(full.shape[0] - 1):
-            i = 0
-            a = vid(jc, 0)
-            b = vid(jc + 1, 0)
-            c = vid(jc + 1, 1)
-            d = vid(jc, 1)
-            # Already covered above by lateral loop for i=0..1; skip.
-            break
-        # Closing strip edges: top edge (jc=0 ↔ jc=last) connect across
-        # residues to give a side face
+        # Close the strip edges: top row (jc=0) ↔ bottom row (jc=last)
         top = full.shape[0] - 1
-        for i in range(n - 1):
-            a = vid(0, i)
-            b = vid(0, i + 1)
-            c = vid(top, i + 1)
-            d = vid(top, i)
+        for k in range(n - 1):
+            a = vid(0, k)
+            b = vid(0, k + 1)
+            c = vid(top, k + 1)
+            d = vid(top, k)
             faces_list.append([3, a, b, c])
             faces_list.append([3, a, c, d])
 
@@ -949,18 +1002,11 @@ def ribbon(
         verts_arr = np.array(verts_list, dtype=float)
         faces_arr = np.hstack(faces_list).astype(np.int64)
         mesh = pv.PolyData(verts_arr, faces=faces_arr)
-        # Assign per-cell color (interpolated between cross-section rows)
+        # Assign per-cell color from cols[][]
         n_cells = mesh.n_cells
-        # Walk face list and assign color from cols[][] using the
-        # average across the cell's vertices (approximation: use
-        # the residue index of the first vertex).
         cell_colors = np.zeros((n_cells, 3))
-        # Re-walk to assign colors based on residue i (use middle of
-        # the quad)
         for ci, face in enumerate(faces_list):
-            # face is [n, v0, v1, ..., v_{n-1}]; we only have triangles
             verts = face[1:]
-            # Each vert = jc * n + i, so i = vert % n
             i_avg = sum((v % n) for v in verts) / len(verts)
             jc_avg = sum((v // n) for v in verts) / len(verts)
             i_idx = int(round(i_avg))
