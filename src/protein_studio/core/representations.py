@@ -81,7 +81,8 @@ def _safe_import_pyvista():
 def ball_and_stick(
     mol: Molecule,
     scheme: ColorScheme | None = None,
-    bond_radius: float = 0.20,
+    bond_radius: float = 0.15,
+    atom_radius: float = 0.30,
     include_hetero: bool = True,
 ) -> "object":
     """Return a dict with two :class:`pyvista.PolyData` meshes:
@@ -97,7 +98,14 @@ def ball_and_stick(
 
     coords = np.array([a.coord for a in atoms], dtype=float)
     colors = _colors_for(atoms, scheme)
-    radii = np.array([_ELEM_RADII.get(a.element, 0.65) for a in atoms], dtype=float)
+    # In ball-and-stick we use a *display* radius per element that's a
+    # blend of true VdW and a uniform baseline so atoms are large
+    # enough to read as spheres but small enough that the bonds
+    # between them stay visible. PyMOL defaults to ~0.3 Å for carbon;
+    # the blend here keeps that baseline but scales heavier elements
+    # up proportionally.
+    radii = np.array([atom_radius * max(0.7, _ELEM_RADII.get(a.element, 0.65) / 0.77)
+                      for a in atoms], dtype=float)
 
     atom_mesh = pv.PolyData(coords)
     atom_mesh.point_data["colors"] = colors

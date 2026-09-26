@@ -123,6 +123,27 @@ def test_ball_and_stick_returns_dict():
     assert out["bonds"].n_cells > 0
 
 
+def test_ball_and_stick_atoms_are_smaller_than_vdw():
+    """Ball-and-stick atoms must use a display radius smaller than true
+    van der Waals so the bonds between them stay visible — PyMOL and
+    3Dmol.js both default to ~0.3 Å regardless of element."""
+    mol = load_pdb(EXAMPLES / "1aki.pdb")
+    out = ball_and_stick(mol)
+    radii = out["atoms"].point_data["radii"]
+    # Largest atom in 1aki is sulfur (1.02 Å VdW) — its display radius
+    # should still be < 0.7 Å, otherwise bonds between C-C (0.77 VdW)
+    # would be entirely hidden inside the spheres.
+    assert float(radii.max()) < 0.7, (
+        f"ball-and-stick atom radius too large (max={float(radii.max()):.3f} Å); "
+        f"bonds between atoms will be hidden inside the spheres."
+    )
+    # And the smallest atom (hydrogen, 0.25 VdW) should still be visible.
+    assert float(radii.min()) > 0.15, (
+        f"ball-and-stick atom radius too small (min={float(radii.min()):.3f} Å); "
+        f"atoms will be invisible."
+    )
+
+
 def test_point_cloud_renders_points():
     import pyvista as pv
     mol = load_pdb(EXAMPLES / "1ubq.pdb")
