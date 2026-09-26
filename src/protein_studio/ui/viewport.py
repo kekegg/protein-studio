@@ -195,23 +195,48 @@ class ViewportWidget(QWidget):
         ``deg_per_sec=18`` is roughly one full turn every 20 seconds —
         fast enough to be obvious, slow enough not to induce motion
         sickness.
+
+        Implementation notes
+        ---------------------
+        Each tick we rotate the camera via the underlying VTK
+        ``vtkCamera.Azimuth()`` method (avoids PyVista's property
+        setter overhead) and call ``render_window.Render()`` directly
+        — NOT ``plotter.render()``, which re-runs the entire PyVista
+        pipeline (lights, axes, scalar-bar updates) every tick and
+        is what caused the stutter in earlier iterations.
         """
         self.stop_spin()  # avoid double-start
         from PySide6.QtCore import QTimer
-        interval_ms = max(16, int(1000 / 60))  # 60 fps cap
+        # Cache references once so the per-tick hot path doesn't pay
+        # the PyVista property-access cost.
+        try:
+            self._spin_cam = self.plotter.renderer.GetActiveCamera()
+            self._spin_render_window = (
+                self.plotter.render_window if hasattr(self.plotter, "render_window")
+                else self.plotter.renderer.GetRenderWindow()
+            )
+        except Exception:
+            self._spin_cam = None
+            self._spin_render_window = None
+        if self._spin_cam is None or self._spin_render_window is None:
+            return  # nothing to spin
+
+        interval_ms = 16  # ~60 fps
         deg_per_tick = deg_per_sec * interval_ms / 1000.0
         self._spin_timer = QTimer(self)
+        # PreciseTimer: requests sub-millisecond accuracy on platforms
+        # that support it (Cocoa / Win32). Falls back to coarse timer
+        # elsewhere. This is the single biggest fix for the visible
+        # stutter — the default coarse timer on macOS can drift to
+        # 30+ ms intervals, which produces an obvious judder.
+        self._spin_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._spin_timer.setInterval(interval_ms)
+        cam = self._spin_cam
+        win = self._spin_render_window
         def _tick():
             try:
-                # PyVista exposes the camera's azimuth as a Python
-                # property; assigning to it rotates the camera around
-                # its focal point. Equivalent to the underlying
-                # vtkCamera.Azimuth() call.
-                self.plotter.camera.azimuth = (
-                    self.plotter.camera.azimuth + deg_per_tick
-                )
-                self.plotter.render()
+                cam.Azimuth(deg_per_tick)
+                win.Render()
             except Exception:
                 self.stop_spin()
         self._spin_timer.timeout.connect(_tick)
