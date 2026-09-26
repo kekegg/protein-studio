@@ -10,9 +10,78 @@ Renders the current scene's meshes and supports:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Orientation-marker widget registry
+# ---------------------------------------------------------------------------
+# PyVista's ``add_axes()`` installs a ``vtkOrientationMarkerWidget`` on the
+# renderer's interactor. VTK's destructor for this widget calls
+# ``SetEnabled(0)`` defensively, which iterates ``vtkViewport::RemoveViewProp``
+# over its axes actor and releases the per-vertex GL buffer objects. If
+# that destructor runs on a thread that doesn't have the QOpenGLContext
+# current (e.g. an asyncio task step in the MCP server's background
+# thread, or Python's cyclic GC firing during interpreter shutdown), the
+# ``glDeleteBuffers`` call hits a wild pointer and segfaults.
+#
+# Two complementary defences live here:
+#
+#   1. We keep a module-level strong reference to every widget created by
+#      ``add_axes``. As long as the registry holds the widget, Python's
+#      cyclic GC can't collect it. The registry is cleared during
+#      ``ViewportWidget.shutdown()``, by which point we've explicitly
+#      disabled the widget and detached it from the interactor so the
+#      VTK destructor is a no-op.
+#
+#   2. Each widget also gets a ``weakref.finalize`` hook that runs
+#      *before* the destructor. The hook checks the current QOpenGL
+#      context: if no context is current (the crash scenario), we
+#      manually disable the widget via a queued call to the GUI thread.
+#      That call lands while the QOpenGLWidget still owns a valid GL
+#      context, so ``SetEnabled(0)`` runs cleanly there.
+
+_ORIENTATION_WIDGETS: List[Any] = []
+
+
+def _safe_axes_finalizer(widget: Any) -> None:
+    """weakref.finalize callback — runs before the VTK destructor.
+
+    Called when the widget is being garbage-collected. If we're on a
+    thread without a current GL context (the crash scenario), we
+    schedule the teardown on the GUI thread instead, which *does*
+    have a valid context. If the GUI thread is also gone, we give up
+    silently — better a leaked widget than a segfault.
+    """
+    try:
+        from PySide6.QtGui import QOpenGLContext
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import QTimer
+    except ImportError:
+        return
+
+    if QOpenGLContext.currentContext() is not None:
+        # Safe to disable right here. Idempotent so the explicit
+        # shutdown path doesn't double-fire.
+        try:
+            widget.EnabledOff()
+        except Exception:
+            pass
+        return
+
+    # No GL context on this thread — bounce to the GUI thread via a
+    # single-shot QTimer (zero-delay). That schedules a callback on
+    # the GUI thread's event loop, where the QOpenGLWidget's context
+    # is current.
+    app = QApplication.instance()
+    if app is None:
+        return
+    try:
+        QTimer.singleShot(0, lambda: _safe_axes_finalizer(widget))
+    except Exception:
+        pass
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
@@ -102,6 +171,27 @@ class ViewportWidget(QWidget):
             self._axes_visible = True
         else:
             self._axes_visible = False
+        # Capture a strong reference to the orientation marker widget.
+        # PyVista stores it as ``plotter.renderer.axes_widget``; without
+        # our own reference, Python's cyclic GC can collect it from an
+        # unrelated thread (e.g. an asyncio task in the MCP server's
+        # background thread). Its VTK destructor then calls
+        # ``SetEnabled(0)`` which tries to release GL buffer objects on a
+        # context that isn't current on the GC thread — use-after-free
+        # inside ``glDeleteBuffers`` → segfault.
+        self._axes_widget = getattr(
+            getattr(self.plotter, "renderer", None), "axes_widget", None)
+        if self._axes_widget is not None:
+            _ORIENTATION_WIDGETS.append(self._axes_widget)
+            # weakref.finalize runs BEFORE the VTK destructor. We use it
+            # to guard SetEnabled(0): if the GC fires on a thread without
+            # a current GL context, the callback re-dispatches the
+            # teardown to the GUI thread instead of letting the C++
+            # destructor crash inside glDeleteBuffers.
+            import weakref
+            weakref.finalize(self._axes_widget,
+                             _safe_axes_finalizer,
+                             self._axes_widget)
         if hasattr(self, "plotter") and isinstance(self.plotter, QWidget):
             layout.addWidget(self.plotter, 1)
 
@@ -273,11 +363,16 @@ class ViewportWidget(QWidget):
         We close the plotter explicitly, in order:
 
         1. Stop the spin timer (it pokes the render window).
-        2. Hide the plotter widget — Qt stops scheduling paints.
-        3. Call ``plotter.close()`` — PyVistaQt's hook that removes
+        2. Disable + detach the orientation marker widget while we
+           still have a valid GL context, so its later destructor is
+           a no-op.
+        3. Hide the plotter widget — Qt stops scheduling paints.
+        4. Call ``plotter.close()`` — PyVistaQt's hook that removes
            the orientation marker, clears lights, and finalises the
            render window while the GL context is still alive.
-        4. Break our own reference cycle so the next GC pass doesn't
+        5. Drop our strong reference to the orientation marker (and
+           remove it from the module registry), so GC can collect it.
+        6. Break our own reference cycle so the next GC pass doesn't
            try to use the (now-dead) plotter.
         """
         if getattr(self, "_shutdown_done", False):
@@ -287,6 +382,34 @@ class ViewportWidget(QWidget):
             self.stop_spin()
         except Exception:
             pass
+
+        # 2. Disable the orientation marker widget while we still own a
+        #    valid GL context. This makes its eventual VTK destructor a
+        #    no-op (SetEnabled(0) is idempotent — it skips when the
+        #    widget is already disabled).
+        axes_widget = getattr(self, "_axes_widget", None)
+        if axes_widget is not None:
+            try:
+                # Bind the interactor's GL context to the current thread
+                # so the EnabledOff() → ReleaseGraphicsResources chain
+                # has a valid context to operate on.
+                iren = getattr(self.plotter, "iren", None) if hasattr(
+                    self, "plotter") else None
+                if iren is not None:
+                    inner = getattr(iren, "interactor", iren)
+                    if hasattr(inner, "MakeCurrent"):
+                        try:
+                            inner.MakeCurrent()
+                        except Exception:
+                            pass
+                axes_widget.EnabledOff()
+                # Detach from the interactor so VTK doesn't try to
+                # call back into a freed object.
+                if hasattr(axes_widget, "SetInteractor"):
+                    axes_widget.SetInteractor(None)
+            except Exception:
+                pass
+
         plotter = getattr(self, "plotter", None)
         if plotter is not None:
             try:
@@ -304,6 +427,17 @@ class ViewportWidget(QWidget):
                     plotter.close()
             except Exception:
                 pass
+
+        # 5. Drop the strong references to the orientation marker now
+        #    that the widget is disabled and detached. GC can collect
+        #    it later without touching GL.
+        try:
+            if axes_widget is not None and axes_widget in _ORIENTATION_WIDGETS:
+                _ORIENTATION_WIDGETS.remove(axes_widget)
+        except Exception:
+            pass
+        self._axes_widget = None
+
         try:
             if plotter is not None and hasattr(plotter, "deleteLater"):
                 plotter.deleteLater()
