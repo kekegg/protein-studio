@@ -32,6 +32,7 @@ from ..core.io import load_pdb, save_pdb
 from ..core.scene import Scene
 from .console import PythonConsole
 from .editor import PythonEditor
+from .mcp_controller import MCPController
 from .outliner import OutlinerWidget
 from .properties import PropertiesWidget
 from .viewport import ViewportWidget
@@ -89,6 +90,18 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("Ready")
         self.status.addWidget(self._status_label)
 
+        # MCP controller (lazy) — manages a stdio subprocess that
+        # exposes the StudioAPI as 20 MCP tools. Started/stopped via
+        # the Tools menu and the toolbar pill.
+        self._mcp = MCPController(self)
+        self._mcp.state_changed.connect(self._on_mcp_state_changed)
+        self._mcp_status_label = QLabel("MCP: stopped")
+        self._mcp_status_label.setStyleSheet(
+            "QLabel { padding: 2px 10px; border: 1px solid #555; "
+            "border-radius: 9px; color: #888; }"
+        )
+        self.status.addPermanentWidget(self._mcp_status_label)
+
         # Wire events
         self.properties.object_modified.connect(self._on_object_modified)
         self.scene.on_change(self._on_scene_change)
@@ -127,6 +140,20 @@ class MainWindow(QMainWindow):
         m_help = menubar.addMenu("&Help")
         m_help.addAction(self._mk_action("About", None, self.show_about))
 
+        # Tools (MCP server control)
+        m_tools = menubar.addMenu("&Tools")
+        self._mcp_start_action = self._mk_action(
+            "Start MCP Server", None, self._on_mcp_start)
+        self._mcp_stop_action = self._mk_action(
+            "Stop MCP Server",  None, self._on_mcp_stop)
+        self._mcp_log_action = self._mk_action(
+            "Show MCP Log…",    None, self._on_mcp_show_log)
+        m_tools.addAction(self._mcp_start_action)
+        m_tools.addAction(self._mcp_stop_action)
+        m_tools.addSeparator()
+        m_tools.addAction(self._mcp_log_action)
+        self._sync_mcp_actions("stopped")
+
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main")
         tb.setMovable(False)
@@ -163,6 +190,18 @@ class MainWindow(QMainWindow):
         )
         self._spin_btn.toggled.connect(self._on_spin_toggled)
         tb.addWidget(self._spin_btn)
+        # MCP server pill — green when running, gray when stopped.
+        self._mcp_btn = QPushButton("MCP")
+        self._mcp_btn.setCheckable(True)
+        self._mcp_btn.setStyleSheet(
+            "QPushButton { background: #3a3a3a; color: #dcdcdc; "
+            "padding: 4px 12px; border: 1px solid #555; border-radius: 3px; }"
+            "QPushButton:hover { background: #4a4a4a; }"
+            "QPushButton:checked { background: #2a7a3a; color: #fff; "
+            "border: 1px solid #4a9a5a; }"
+        )
+        self._mcp_btn.toggled.connect(self._on_mcp_btn_toggled)
+        tb.addWidget(self._mcp_btn)
         tb.addSeparator()
         self._render_label = QLabel("Cartoon")
         self._render_label.setStyleSheet("color: #888; padding: 4px 12px;")
@@ -175,11 +214,75 @@ class MainWindow(QMainWindow):
         else:
             self.viewport.stop_spin()
 
+    # ------------------------------------------------------------------ MCP
+    def _on_mcp_start(self) -> None:
+        """Start the MCP server subprocess (Tools → Start MCP Server)."""
+        if self._mcp.is_running():
+            return
+        self._mcp.start()
+
+    def _on_mcp_stop(self) -> None:
+        """Stop the MCP server subprocess (Tools → Stop MCP Server)."""
+        self._mcp.stop()
+
+    def _on_mcp_show_log(self) -> None:
+        """Open the log dialog (Tools → Show MCP Log…)."""
+        self._mcp.show_log(self)
+
+    def _on_mcp_btn_toggled(self, checked: bool) -> None:
+        """Toolbar MCP pill — toggles the server on/off."""
+        if checked:
+            self._mcp.start()
+        else:
+            self._mcp.stop()
+
+    def _on_mcp_state_changed(self, state: str) -> None:
+        """Sync menu / toolbar / status bar to the new state."""
+        self._sync_mcp_actions(state)
+        # Status-bar pill
+        if state == "running":
+            text = "● MCP: running"
+            color = "#5eba7d"
+        elif state == "starting":
+            text = "● MCP: starting…"
+            color = "#d8c04a"
+        elif state == "stopping":
+            text = "● MCP: stopping…"
+            color = "#d8c04a"
+        elif state == "failed":
+            text = "● MCP: failed"
+            color = "#d8554a"
+        else:  # stopped
+            text = "● MCP: stopped"
+            color = "#888"
+        self._mcp_status_label.setText(text)
+        self._mcp_status_label.setStyleSheet(
+            f"QLabel {{ padding: 2px 10px; border: 1px solid #555; "
+            f"border-radius: 9px; color: {color}; }}")
+        # Toolbar pill stays in sync (don't recurse via toggled signal)
+        if self._mcp_btn.isChecked() != (state in ("running", "starting")):
+            blocker = self._mcp_btn.blockSignals(True)
+            try:
+                self._mcp_btn.setChecked(state in ("running", "starting"))
+            finally:
+                self._mcp_btn.blockSignals(blocker)
+
+    def _sync_mcp_actions(self, state: str) -> None:
+        """Enable/disable menu actions based on the server state."""
+        running = state in ("running", "starting")
+        self._mcp_start_action.setEnabled(not running)
+        self._mcp_stop_action.setEnabled(state == "running")
+
     def closeEvent(self, event) -> None:
-        """Make sure the spin QTimer is stopped when the window closes,
-        otherwise it could leak into the next session."""
+        """Stop the spin timer and the MCP subprocess on window close
+        so nothing leaks into the next session."""
         try:
             self.viewport.stop_spin()
+        except Exception:
+            pass
+        try:
+            if self._mcp.is_running() or self._mcp.state == "starting":
+                self._mcp.stop()
         except Exception:
             pass
         super().closeEvent(event)
