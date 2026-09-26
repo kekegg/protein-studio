@@ -45,6 +45,69 @@ def test_partial_charges_shape_and_signs():
     assert abs(q.mean()) < 0.3
 
 
+def test_amber_table_covers_standard_residues():
+    """The AMBER table should cover the 20 standard amino acids at
+    least for backbone atoms N, CA, C, O."""
+    from protein_studio.core.charges import _AMBER_PARTIAL_CHARGES
+    for resn in ("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU "
+                 "LYS MET PHE PRO SER THR TRP TYR VAL".split()):
+        for atom in ("N", "CA", "C", "O"):
+            key = f"{resn}:{atom}"
+            assert key in _AMBER_PARTIAL_CHARGES, f"missing AMBER charge for {key}"
+            assert -1.0 <= _AMBER_PARTIAL_CHARGES[key] <= 1.0
+
+
+def test_amber_table_signs_match_residue_chemistry():
+    """ARG/LYS side-chain nitrogens are strongly positive, ASP/GLU
+    carboxyl oxygens are strongly negative."""
+    from protein_studio.core.charges import _AMBER_PARTIAL_CHARGES
+    # Basic
+    assert _AMBER_PARTIAL_CHARGES["ARG:NH1"] > 0.1
+    assert _AMBER_PARTIAL_CHARGES["ARG:NH2"] > 0.1
+    assert _AMBER_PARTIAL_CHARGES["LYS:NZ"] > 0.5
+    # Acidic
+    assert _AMBER_PARTIAL_CHARGES["ASP:OD1"] < -0.3
+    assert _AMBER_PARTIAL_CHARGES["ASP:OD2"] < -0.3
+    assert _AMBER_PARTIAL_CHARGES["GLU:OE1"] < -0.3
+    assert _AMBER_PARTIAL_CHARGES["GLU:OE2"] < -0.3
+
+
+def test_ses_surface_returns_closed_mesh():
+    """The SES surface mesh from ``surface()`` should have a reasonable
+    vertex + triangle count and not be empty."""
+    import pyvista as pv
+    from protein_studio.core.representations import surface
+    mol = load_pdb(EXAMPLES / "1ubq.pdb")
+    mesh = surface(mol, surface_type="MS", scale_factor=2.0)
+    assert isinstance(mesh, pv.PolyData)
+    assert mesh.n_points > 100, f"SES too sparse ({mesh.n_points} pts)"
+    assert mesh.n_cells > 100, f"SES too sparse ({mesh.n_cells} faces)"
+    # Per-vertex atom_id should be set
+    assert "atom_id" in (mesh.point_data.keys() or [])
+
+
+def test_vdw_surface_tighter_than_ses():
+    """VDW surface (smaller probe) should be at least as close to
+    the atoms as the SES surface (which has probe=1.4 Å inflated
+    radii)."""
+    from protein_studio.core.representations import surface
+    from protein_studio.core.io import load_pdb
+    mol = load_pdb(EXAMPLES / "1ubq.pdb")
+    vdw = surface(mol, surface_type="VDW", scale_factor=2.0)
+    ses = surface(mol, surface_type="MS", scale_factor=2.0)
+    assert vdw.n_points > 0 and ses.n_points > 0
+    # Bounding-box diagonal: SES is the *outer* envelope so it should
+    # be at least as large as the VDW surface on every axis.
+    vdw_ext = vdw.bounds
+    ses_ext = ses.bounds
+    vdw_size = [vdw_ext[1] - vdw_ext[0], vdw_ext[3] - vdw_ext[2], vdw_ext[5] - vdw_ext[4]]
+    ses_size = [ses_ext[1] - ses_ext[0], ses_ext[3] - ses_ext[2], ses_ext[5] - ses_ext[4]]
+    for v, s in zip(vdw_size, ses_size):
+        assert s >= v - 1e-3, (
+            f"SES surface should be larger than VDW: VDW={vdw_size}, SES={ses_size}"
+        )
+
+
 def test_esp_surface_returns_points_and_potential():
     mol = load_pdb(EXAMPLES / "1ubq.pdb")
     pts, pot = compute_esp_surface(mol, config=ESPConfig(n_sample_points=300))
@@ -61,10 +124,14 @@ def test_esp_to_rgb_zero_is_white():
 def test_esp_surface_mesh_has_colors():
     import pyvista as pv
     mol = load_pdb(EXAMPLES / "1ubq.pdb")
-    mesh = esp_surface(mol, n_points=400)
+    # New API: scale_factor is the EDTSurf grid knob; n_points is
+    # gone (the mesh is the SES surface directly).
+    mesh = esp_surface(mol, scale_factor=2.0)
     assert isinstance(mesh, pv.PolyData)
-    # The mesh carries per-cell colors
-    assert "colors" in (mesh.cell_data.keys() or []) or "colors" in (mesh.point_data.keys() or [])
+    # The mesh carries per-vertex colors (and per-vertex potential)
+    assert "colors" in (mesh.point_data.keys() or []) or \
+           "colors" in (mesh.cell_data.keys() or [])
+    assert "potential" in (mesh.point_data.keys() or [])
 
 
 # ============================================================== H-bonds

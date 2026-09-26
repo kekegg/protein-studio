@@ -1097,37 +1097,96 @@ def surface(
     mol: Molecule,
     scheme: ColorScheme | None = None,
     probe_radius: float = 1.4,
-    resolution: int = 12,
+    surface_type: str = "MS",
+    scale_factor: float = 2.0,
+    include_hetero: bool = False,
 ) -> "object":
-    """Generate a per-atom sphere-union surface using PyVista's filter.
+    """Generate a molecular surface mesh using the EDTSurf algorithm.
 
-    This is a coarse molecular surface (sum of VdW spheres expanded by
-    *probe_radius*) — fast but not as smooth as a real solvent-excluded
-    surface.
+    A port of 3Dmol.js's :class:`ProteinSurface4` (Xu & Zhang 2009) to
+    Python. We voxelize the atoms, run a Euclidean distance transform
+    from the boundary, then run marching cubes at the iso-value
+    determined by *surface_type*:
+
+    * ``"MS"`` (default) — solvent-excluded surface (SES). Iso =
+      ``probeRadius²`` on the distance field. This is the smooth
+      closed surface you see in PyMOL/3Dmol.js for "molecular surface".
+    * ``"SAS"`` — solvent-accessible surface (probe rolled over VdW).
+      Iso = 0.5 on the probe-expanded inside mask.
+    * ``"VDW"`` — van der Waals surface (union of VdW spheres). Iso =
+      0.5 on the inside mask.
+
+    ``scale_factor=2`` (default) gives 0.5 Å voxels — the same
+    resolution 3Dmol.js uses. Finer is possible but rarely visible;
+    coarser is faster but stair-step artifacts appear.
+
+    The resulting mesh has per-vertex colors from *scheme* plus a
+    ``atom_id`` point-data array mapping each vertex to its nearest
+    atom (useful for downstream property coloring, including ESP).
     """
+    from .surface import (
+        generate_ses_surface,
+        SURFACE_MS, SURFACE_SAS, SURFACE_VDW,
+    )
     pv = _safe_import_pyvista()
     scheme = scheme or ColorScheme("Element", "element")
-    atoms = mol.atoms
+
+    atoms_all = mol.atoms
+    if not atoms_all:
+        return pv.PolyData()
+    # Optionally drop HETATM (HEM, water, ions) — they're usually
+    # surface noise and make the grid much larger.
+    if include_hetero:
+        atoms = atoms_all
+    else:
+        atoms = [a for a in atoms_all if not a.is_hetero]
     if not atoms:
         return pv.PolyData()
-    coords = np.array([a.coord for a in atoms], dtype=float)
-    colors = _colors_for(atoms, scheme)
-    radii = np.array([_ELEM_RADII.get(a.element, 0.65) + probe_radius for a in atoms])
 
-    cloud = pv.PolyData(coords)
-    cloud.point_data["colors"] = colors
-    cloud.point_data["radii"] = radii
-    sphere = pv.Sphere(theta_resolution=resolution, phi_resolution=resolution, radius=1.0)
-    glyph = cloud.glyph(scale="radii", factor=1.0, geom=sphere)
+    coords = np.array([a.coord for a in atoms], dtype=float)
+    elements = [a.element for a in atoms]
+    atom_idx_in_mol = np.array(
+        [atoms_all.index(a) if a in atoms_all else -1 for a in atoms],
+        dtype=np.int64,
+    )
+
+    stype_map = {"MS": SURFACE_MS, "SAS": SURFACE_SAS, "VDW": SURFACE_VDW}
+    stype = stype_map.get(surface_type.upper(), SURFACE_MS)
+    result = generate_ses_surface(
+        coords, elements,
+        probe_radius=probe_radius, surface_type=stype,
+        scale_factor=scale_factor, atom_indices=atom_idx_in_mol,
+    )
+    if len(result.vertices) == 0:
+        return pv.PolyData()
+
+    mesh = pv.PolyData(result.vertices, faces=_tri_flat(result.faces))
+    # Per-vertex colour from the scheme — use atom_id to look up the
+    # scheme colour of the nearest atom.
+    colors = np.array([scheme.color(atoms[i]) for i in result.atom_id])
+    mesh.point_data["colors"] = colors
+    mesh.point_data["atom_id"] = result.atom_id
+    # Smooth shading requires vertex normals
     try:
-        surf = glyph.extract_surface(algorithm="dataset_surface")
-        try:
-            surf.cell_data["colors"] = surf.points_to_point_data()["colors"]
-        except Exception:
-            pass
+        mesh.compute_normals(point_normals=True, auto_orient_normals=True,
+                              inplace=True)
     except Exception:
-        surf = glyph
-    return surf
+        pass
+    return mesh
+
+
+def _tri_flat(faces: np.ndarray) -> np.ndarray:
+    """Convert (F, 3) triangle vertex indices to PyVista's flat format
+    ``[3, a, b, c, 3, a, b, c, ...]``."""
+    if len(faces) == 0:
+        return np.zeros(0, dtype=np.int64)
+    n = len(faces)
+    out = np.empty(n * 4, dtype=np.int64)
+    out[0::4] = 3
+    out[1::4] = faces[:, 0]
+    out[2::4] = faces[:, 1]
+    out[3::4] = faces[:, 2]
+    return out
 
 
 def point_cloud(
@@ -1150,59 +1209,99 @@ def esp_surface(
     mol: Molecule,
     scheme: ColorScheme | None = None,
     probe_radius: float = 1.4,
-    n_points: int = 4000,
+    scale_factor: float = 2.0,
+    decay: float = 1.5,
+    min_distance: float = 0.7,
+    range_kcal: float = 5.0,
+    include_hetero: bool = False,
 ) -> "object":
     """Molecular surface colored by approximate electrostatic potential.
 
-    Implementation note: a full Coulomb sum over all atoms tends to
-    paint the whole surface the same color (because backbone O dominate
-    the cumulative potential). Instead, we colour each surface sphere
-    by a *local* ESP — the sum over the 12 nearest atoms — which
-    highlights charged patches and produces a visually rich map.
+    Implementation
+    --------------
+    1. Build an SES surface mesh using the EDTSurf algorithm (same
+       as :func:`surface`).
+    2. Assign per-atom partial charges from the AMBER ff99SB-style
+       table (same as 3Dmol.js / PyMOL).
+    3. For each surface vertex, compute the simplified Coulomb sum
+
+           V(r) = Σᵢ qᵢ / max(|r - rᵢ|, min_distance) ^ decay
+
+       where qᵢ is the AMBER partial charge of atom i.
+    4. Map V to a red-white-blue gradient (negative → red, neutral →
+       white, positive → blue) via :func:`charges.esp_to_rgb`.
+
+    Parameters
+    ----------
+    probe_radius : solvent probe radius in Å.
+    scale_factor : EDTSurf grid resolution (1/scale Å).
+    decay : distance-decay exponent (1.0 = pure Coulomb, 2.0 =
+            screened / sharper falloff).
+    min_distance : lower bound on |r - rᵢ| to avoid singularity.
+    range_kcal : potential value mapped to ±1 (tanh saturation).
+    include_hetero : whether to include HETATM atoms in the surface
+                     (and the potential sum).
     """
     from .charges import assign_partial_charges, esp_to_rgb
+    from .surface import generate_ses_surface, SURFACE_MS
     pv = _safe_import_pyvista()
 
-    atoms = [a for a in mol.atoms if not a.is_hetero]
+    atoms_all = mol.atoms
+    if not atoms_all:
+        return pv.PolyData()
+    # Decide which atoms participate
+    if include_hetero:
+        atoms = atoms_all
+    else:
+        atoms = [a for a in atoms_all if not a.is_hetero]
     if not atoms:
         return pv.PolyData()
+
     coords = np.array([a.coord for a in atoms], dtype=float)
-    q = assign_partial_charges(mol)
-    q = q[np.array([not a.is_hetero for a in mol.atoms])]
+    elements = [a.element for a in atoms]
+    # Map these atom positions back to mol.atoms indices (for charge lookup).
+    atom_idx_in_mol = np.array(
+        [atoms_all.index(a) if a in atoms_all else -1 for a in atoms],
+        dtype=np.int64,
+    )
 
-    # For each atom, sum partial charges of K nearest neighbours
-    K = 12
-    n = len(coords)
-    if n <= K:
-        per_atom_pot = q.copy()
-    else:
-        diff = coords[:, None, :] - coords[None, :, :]
-        dist2 = np.einsum("ijk,ijk->ij", diff, diff)
-        nearest = np.argpartition(dist2, K, axis=1)[:, :K]
-        per_atom_pot = np.array([q[nearest[i]].sum() for i in range(n)])
+    # 1) SES mesh
+    ses = generate_ses_surface(
+        coords, elements,
+        probe_radius=probe_radius, surface_type=SURFACE_MS,
+        scale_factor=scale_factor, atom_indices=atom_idx_in_mol,
+    )
+    if len(ses.vertices) == 0:
+        return pv.PolyData()
 
-    # Map to colour via tanh to keep range bounded
-    per_atom_pot = np.tanh(per_atom_pot / 0.6)
-    per_atom_colors = esp_to_rgb(per_atom_pot)
+    # 2) Charges for *all* participating atoms (use the AMBER table;
+    #    fall back to element heuristic for atoms not in the table).
+    q_mol = assign_partial_charges(mol)
+    q = q_mol[atom_idx_in_mol]   # align with `atoms` ordering
+    atom_coords_q = coords       # coordinates of the charged atoms
 
-    # Render as sphere union
-    all_coords = np.array([a.coord for a in mol.atoms], dtype=float)
-    all_colors = np.zeros((len(mol.atoms), 3), dtype=float)
-    all_pot = np.zeros(len(mol.atoms), dtype=float)
-    # hetero atoms → neutral grey
-    hetero_mask = np.array([a.is_hetero for a in mol.atoms])
-    protein_mask = ~hetero_mask
-    protein_indices = np.where(protein_mask)[0]
-    for i, idx in enumerate(protein_indices):
-        all_colors[idx] = per_atom_colors[i]
-        all_pot[idx] = per_atom_pot[i]
-    all_colors[hetero_mask] = (0.85, 0.85, 0.85)
+    # 3) Vectorized Coulomb-sum on the surface vertices.
+    verts = ses.vertices
+    diff = verts[:, None, :] - atom_coords_q[None, :, :]
+    dist = np.linalg.norm(diff, axis=2)
+    dist = np.maximum(dist, min_distance)
+    pot = (q[None, :] / np.power(dist, decay)).sum(axis=1)
+    # Saturate via tanh
+    pot = np.tanh(pot / range_kcal)
 
-    radii = np.array([_ELEM_RADII.get(a.element, 0.65) + probe_radius
-                      for a in mol.atoms])
-    cloud = pv.PolyData(all_coords)
-    cloud.point_data["colors"] = all_colors
-    cloud.point_data["potential"] = all_pot
+    # 4) RGB
+    rgb = esp_to_rgb(pot)
+
+    mesh = pv.PolyData(verts, faces=_tri_flat(ses.faces))
+    mesh.point_data["colors"] = rgb
+    mesh.point_data["potential"] = pot
+    mesh.point_data["atom_id"] = ses.atom_id
+    try:
+        mesh.compute_normals(point_normals=True, auto_orient_normals=True,
+                              inplace=True)
+    except Exception:
+        pass
+    return mesh
     cloud.point_data["radii"] = radii
     sphere = pv.Sphere(theta_resolution=12, phi_resolution=12, radius=1.0)
     glyph = cloud.glyph(scale="radii", factor=1.0, geom=sphere)

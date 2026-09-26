@@ -1,15 +1,18 @@
 """Partial-charge assignment + electrostatic-surface computation.
 
 The aim is *not* to reproduce APBS-quality electrostatics — for that
-you would need a Poisson–Boltzmann solver. Instead, we compute a
-lightweight Gasteiger-style heuristic charge per atom from atom type
-and connectivity, then sample the simplified Coulomb potential
+you would need a Poisson–Boltzmann solver. Instead, we:
 
-    V(r) = sum_i  q_i / max(|r - r_i|, cutoff)
+1. Assign per-atom charges from the AMBER ff99SB-style table
+   (see ``_AMBER_PARTIAL_CHARGES``) — ported from 3Dmol.js's
+   ``partialCharges.ts`` so behavior matches 3Dmol.js / PyMOL.
+2. Sample the simplified Coulomb potential
 
-on a molecular surface. The result is qualitatively correct
-(negative for acidic side chains, positive for basic ones) and runs
-in well under a second on ubiquitin.
+       V(r) = sum_i  q_i / max(|r - r_i|, cutoff)
+
+   on a molecular surface. The result is qualitatively correct
+   (negative for acidic side chains, positive for basic ones) and
+   runs in well under a second on ubiquitin.
 """
 
 from __future__ import annotations
@@ -22,8 +25,101 @@ import numpy as np
 from .molecule import Atom, Molecule
 
 
-# A small AMBER-like partial-charge table per element.
-# These are coarse defaults — they are NOT a force field.
+# ============================================================ AMBER-style table
+#
+# Per-residue per-atom partial charges, in elementary-charge units.
+# Ported from 3Dmol.js's partialCharges.ts (which itself cites the
+# AMBER ff99SB force field). Lookup is keyed by ``f"{residue}:{atom}"``
+# where residue is the 3-letter name and atom is the PDB atom name.
+# These are NOT directly usable for MD — they're for visualization.
+
+_AMBER_PARTIAL_CHARGES: dict[str, float] = {
+    # ALA
+    "ALA:N": -0.15, "ALA:CA": 0.10, "ALA:CB": 0.00,
+    "ALA:C":  0.60, "ALA:O": -0.55,
+    # ARG
+    "ARG:N": -0.15, "ARG:CA": 0.10, "ARG:CB": 0.00,
+    "ARG:CG": 0.00, "ARG:CD": 0.10, "ARG:NE": -0.10,
+    "ARG:CZ": 0.50, "ARG:NH1": 0.25, "ARG:NH2": 0.25,
+    "ARG:C":  0.60, "ARG:O": -0.55,
+    # ASN
+    "ASN:N": -0.15, "ASN:CA": 0.10, "ASN:CB": 0.00,
+    "ASN:CG": 0.55, "ASN:OD1": -0.55, "ASN:ND2": 0.00,
+    "ASN:C":  0.60, "ASN:O": -0.55,
+    # ASP
+    "ASP:N": -0.15, "ASP:CA": 0.10, "ASP:CB": 0.00,
+    "ASP:CG": 0.14, "ASP:OD1": -0.57, "ASP:OD2": -0.57,
+    "ASP:C":  0.60, "ASP:O": -0.55,
+    # CYS
+    "CYS:N": -0.15, "CYS:CA": 0.10, "CYS:CB": 0.19,
+    "CYS:SG": -0.19, "CYS:C":  0.60, "CYS:O": -0.55,
+    # GLN
+    "GLN:N": -0.15, "GLN:CA": 0.10, "GLN:CB": 0.00,
+    "GLN:CG": 0.00, "GLN:CD": 0.55, "GLN:OE1": -0.55,
+    "GLN:NE2": 0.00, "GLN:C":  0.60, "GLN:O": -0.55,
+    # GLU
+    "GLU:N": -0.15, "GLU:CA": 0.10, "GLU:CB": 0.00,
+    "GLU:CG": 0.00, "GLU:CD": 0.14,
+    "GLU:OE1": -0.57, "GLU:OE2": -0.57,
+    "GLU:C":  0.60, "GLU:O": -0.55,
+    # GLY
+    "GLY:N": -0.15, "GLY:CA": 0.10, "GLY:C":  0.60, "GLY:O": -0.55,
+    # HIS
+    "HIS:N": -0.15, "HIS:CA": 0.10, "HIS:CB": 0.00,
+    "HIS:CG": 0.10, "HIS:ND1": -0.10, "HIS:CD2": 0.10,
+    "HIS:NE2": -0.40, "HIS:CE1": 0.30,
+    "HIS:C":  0.60, "HIS:O": -0.55,
+    # ILE
+    "ILE:N": -0.15, "ILE:CA": 0.10, "ILE:CB": 0.00,
+    "ILE:CG2": 0.00, "ILE:CG1": 0.00, "ILE:CD": 0.00,
+    "ILE:C":  0.60, "ILE:O": -0.55,
+    # LEU
+    "LEU:N": -0.15, "LEU:CA": 0.10, "LEU:CB": 0.00,
+    "LEU:CG": 0.00, "LEU:CD1": 0.00, "LEU:CD2": 0.00,
+    "LEU:C":  0.60, "LEU:O": -0.55,
+    # LYS
+    "LYS:N": -0.15, "LYS:CA": 0.10, "LYS:CB": 0.00,
+    "LYS:CG": 0.00, "LYS:CD": 0.00, "LYS:CE": 0.25,
+    "LYS:NZ": 0.75, "LYS:C":  0.60, "LYS:O": -0.55,
+    # MET
+    "MET:N": -0.15, "MET:CA": 0.10, "MET:CB": 0.00,
+    "MET:CG": 0.06, "MET:SD": -0.12, "MET:CE": 0.06,
+    "MET:C":  0.60, "MET:O": -0.55,
+    # PHE
+    "PHE:N": -0.15, "PHE:CA": 0.10, "PHE:CB": 0.00,
+    "PHE:CG": 0.00, "PHE:CD1": 0.00, "PHE:CD2": 0.00,
+    "PHE:CE1": 0.00, "PHE:CE2": 0.00, "PHE:CZ": 0.00,
+    "PHE:C":  0.60, "PHE:O": -0.55,
+    # PRO
+    "PRO:N": -0.25, "PRO:CD": 0.10, "PRO:CA": 0.10,
+    "PRO:CB": 0.00, "PRO:CG": 0.00, "PRO:C":  0.60, "PRO:O": -0.55,
+    # SER
+    "SER:N": -0.15, "SER:CA": 0.10, "SER:CB": 0.25,
+    "SER:OG": -0.25, "SER:C":  0.60, "SER:O": -0.55,
+    # THR
+    "THR:N": -0.15, "THR:CA": 0.10, "THR:CB": 0.25,
+    "THR:OG1": -0.25, "THR:CG2": 0.00,
+    "THR:C":  0.60, "THR:O": -0.55,
+    # TRP
+    "TRP:N": -0.15, "TRP:CA": 0.10, "TRP:CB": 0.00,
+    "TRP:CG": -0.03, "TRP:CD2": 0.10, "TRP:CE2": -0.04,
+    "TRP:CE3": -0.03, "TRP:CD1": 0.06, "TRP:NE1": -0.06,
+    "TRP:CZ2": 0.00, "TRP:CZ3": 0.00, "TRP:CH2": 0.00,
+    "TRP:C":  0.60, "TRP:O": -0.55,
+    # TYR
+    "TYR:N": -0.15, "TYR:CA": 0.10, "TYR:CB": 0.00,
+    "TYR:CG": 0.00, "TYR:CD1": 0.00, "TYR:CE1": 0.00,
+    "TYR:CD2": 0.00, "TYR:CE2": 0.00, "TYR:CZ": 0.25,
+    "TYR:OH": -0.25, "TYR:C":  0.60, "TYR:O": -0.55,
+    # VAL
+    "VAL:N": -0.15, "VAL:CA": 0.10, "VAL:CB": 0.00,
+    "VAL:CG1": 0.00, "VAL:CG2": 0.00,
+    "VAL:C":  0.60, "VAL:O": -0.55,
+}
+
+
+# Element-level fallback for atoms not covered by the AMBER table
+# (heteroatoms, ions, hydrogens, missing sidechains).
 _DEFAULT_PARTIAL_CHARGES: dict[str, float] = {
     "H":  0.05,
     "C":  0.00,
@@ -45,53 +141,44 @@ _DEFAULT_PARTIAL_CHARGES: dict[str, float] = {
     "MN": 0.20,
 }
 
-# Side-chain corrections: residue_name + atom_name → partial charge override.
-# Numbers come from common AMBER ff99SB sidechain templates.
-_SIDECHAIN_OVERRIDES: dict[tuple[str, str], float] = {
-    # Acidic (negative): ASP/GLU carboxylates
-    ("ASP", "OD1"): -0.80, ("ASP", "OD2"): -0.80,
-    ("GLU", "OE1"): -0.80, ("GLU", "OE2"): -0.80,
-    # Basic (positive): ARG / LYS / HIS — guanine nitrogens carry strong + charges
-    ("ARG", "NH1"):  0.40, ("ARG", "NH2"):  0.40, ("ARG", "NE"):  0.30,
-    ("ARG", "CZ"):   0.40,
-    ("LYS", "NZ"):   0.40,
-    ("HIS", "ND1"):  0.20, ("HIS", "NE2"):  0.20,
-    # Polar but uncharged: SER / THR / TYR / ASN / GLN
-    ("SER", "OG"): -0.65, ("THR", "OG1"): -0.65,
-    ("TYR", "OH"): -0.55,
-    ("ASN", "OD1"): -0.55, ("ASN", "ND2"): -0.40,
-    ("GLN", "OE1"): -0.55, ("GLN", "NE2"): -0.40,
-    # Backbone carbonyl O + amide N carry significant charges
-    ("_BB", "O"):  -0.55,
-    ("_BB", "N"):   0.05,   # amide N is slightly positive when H is present
-    # Terminal charges
-    ("_NTERM", "N"):  0.30,
-    ("_CTERM", "OXT"): -0.80,
-}
 
+def assign_partial_charges(
+    mol: Molecule,
+    *,
+    prefer_amber: bool = True,
+    fallback_to_gasteiger: bool = True,
+) -> np.ndarray:
+    """Return a per-atom partial-charge array (length n_atoms).
 
-def assign_partial_charges(mol: Molecule) -> np.ndarray:
-    """Return a per-atom partial-charge array (length n_atoms)."""
+    Lookup order for each atom:
+
+    1. ``_AMBER_PARTIAL_CHARGES[f"{resn}:{atom}"]`` (only if
+       ``prefer_amber`` is true and the residue name is a standard
+       amino acid).
+    2. ``_DEFAULT_PARTIAL_CHARGES[element]`` — coarse element-wise
+       heuristic (only if ``fallback_to_gasteiger`` is true).
+    3. 0.0 if neither matches.
+
+    Behaviour matches 3Dmol.js's ``applyPartialCharges()`` when
+    ``prefer_amber=True``, ``fallback_to_gasteiger=True``.
+    """
+    STANDARD_AA = set("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU "
+                      "LYS MET PHE PRO SER THR TRP TYR VAL".split())
     out = np.zeros(mol.n_atoms(), dtype=float)
     atoms = mol.atoms
     for i, a in enumerate(atoms):
-        # Backbone atoms first — they dominate the surface
-        if a.name in ("N", "O") and not a.is_hetero:
-            key = ("_BB", a.name)
-            if key in _SIDECHAIN_OVERRIDES:
-                out[i] = _SIDECHAIN_OVERRIDES[key]
+        resn = (a.residue_name or "").upper()
+        atom_name = (a.name or "").upper()
+        # 1) AMBER table — only for standard amino acids, protein atoms
+        if prefer_amber and resn in STANDARD_AA and not a.is_hetero:
+            key = f"{resn}:{atom_name}"
+            if key in _AMBER_PARTIAL_CHARGES:
+                out[i] = _AMBER_PARTIAL_CHARGES[key]
                 continue
-        # Sidechain override (residue_name, atom_name)
-        key2 = (a.residue_name.upper(), a.name.upper())
-        if key2 in _SIDECHAIN_OVERRIDES:
-            out[i] = _SIDECHAIN_OVERRIDES[key2]
-            continue
-        # Terminal residue correction
-        if a.residue_number == 1 and a.name == "N":
-            out[i] = _SIDECHAIN_OVERRIDES[("_NTERM", "N")]
-            continue
-        # Element-based default
-        out[i] = _DEFAULT_PARTIAL_CHARGES.get(a.element.upper(), 0.0)
+        # 2) Element-wise fallback (Gasteiger-ish heuristic)
+        if fallback_to_gasteiger:
+            out[i] = _DEFAULT_PARTIAL_CHARGES.get(a.element.upper(), 0.0)
+        # 3) else 0.0
     return out
 
 
@@ -118,39 +205,56 @@ def compute_esp_surface(
 
     Returns ``(points, potential)`` where ``points`` is an (N, 3) array
     of surface samples and ``potential`` is the per-point ESP value.
+
+    Implementation: build an SES mesh using the EDTSurf algorithm,
+    then sample the simplified Coulomb potential on every vertex.
+    If the mesh has more vertices than ``config.n_sample_points`` we
+    subsample uniformly to keep the call fast.
     """
     cfg = config or ESPConfig()
-    from .representations import surface  # local import to avoid cycles
+    from .surface import generate_ses_surface, SURFACE_MS
 
-    surf = surface(mol, scheme=_DummyUniformScheme(), probe_radius=cfg.probe_radius,
-                   resolution=8)
-    pts = np.asarray(surf.points)
+    atoms_all = mol.atoms
+    if cfg.include_hetero:
+        atoms = atoms_all
+    else:
+        atoms = [a for a in atoms_all if not a.is_hetero]
+    if not atoms:
+        return np.zeros((0, 3)), np.zeros(0)
+    coords = np.array([a.coord for a in atoms], dtype=float)
+    elements = [a.element for a in atoms]
+
+    ses = generate_ses_surface(
+        coords, elements,
+        probe_radius=cfg.probe_radius,
+        surface_type=SURFACE_MS,
+    )
+    pts = ses.vertices
     if len(pts) == 0:
         return pts, np.zeros(0)
 
-    # Reduce samples for speed
+    # Subsample if the mesh is too big
     if len(pts) > cfg.n_sample_points:
         idx = np.linspace(0, len(pts) - 1, cfg.n_sample_points).astype(int)
         pts = pts[idx]
 
-    atoms = mol.atoms
-    # Optionally drop HETATM atoms (HEM cofactors etc.) so they don't
-    # dominate the potential with their multi-atom carboxylate charges.
-    if not cfg.include_hetero:
-        mask = np.array([not a.is_hetero for a in atoms])
-        atoms = [a for a, m in zip(atoms, mask) if m]
-    coords = np.array([a.coord for a in atoms], dtype=float)
+    # Per-atom charges for the participating atoms
     if charges is None:
-        charges = assign_partial_charges(mol)[
-            np.array([not a.is_hetero for a in mol.atoms])
-        ]
+        q_mol = assign_partial_charges(mol)
+        if not cfg.include_hetero:
+            mask = np.array([not a.is_hetero for a in atoms_all])
+            q = q_mol[mask]
+        else:
+            q = q_mol
+    else:
+        q = charges
 
     # Vectorized Coulomb sum
     diff = pts[:, None, :] - coords[None, :, :]
     dist = np.linalg.norm(diff, axis=2)
     dist = np.maximum(dist, cfg.min_distance)
-    pot = (charges[None, :] / np.power(dist, cfg.decay)).sum(axis=1)
-    # Scale for nicer coloring
+    pot = (q[None, :] / np.power(dist, cfg.decay)).sum(axis=1)
+    # Saturate
     pot = np.tanh(pot / cfg.scale_kcal)
     return pts, pot
 
