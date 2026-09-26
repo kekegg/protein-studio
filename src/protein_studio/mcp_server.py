@@ -1,54 +1,51 @@
 """MCP server for LingSu Protein — exposes the StudioAPI as tools.
 
-Run with::
+Two transports
+-------------
+1. **stdio** (legacy / standalone / tests)::
 
-    python -m protein_studio.mcp_server
+       python -m protein_studio.mcp_server
 
-The server runs in stdio mode (no GUI) so an agent can pipe Python
-through ``run_python`` and inspect outputs via the other tools. It
-uses a :class:`~protein_studio.api.HeadlessViewport` under the hood
-so screenshots actually rasterize to PNG.
+   Runs as its own process, creates a fresh ``HeadlessViewport`` so it
+   has *something* to render against. Used by ``/tmp/mcp_smoke.py`` and
+   for one-off headless scripting.
+
+2. **HTTP / streamable-http** (the GUI's transport)::
+
+       from protein_studio.mcp_server import serve_http
+       await serve_http(api, host='127.0.0.1', port=7820)
+
+   Runs *inside* whatever process holds the ``StudioAPI`` (i.e. the
+   GUI). External MCP clients connect to ``http://host:port/mcp``. They
+   see exactly the same scene the GUI sees — because the dispatch
+   callbacks close over the *passed* api, not a new one.
+
+For stdio-only clients (most current MCP client setups), use
+``python -m protein_studio.mcp_bridge`` as the ``command`` in the
+client config — it forwards stdin/stdout to the GUI's TCP endpoint.
 
 Tool surface
 ------------
-Scene ops:
-    list_objects            — enumerate scene objects
-    load_pdb                — load a PDB file (file path required)
-    load_docking            — load Vina / EquiScore results
-    load_alphafold          — load an AlphaFold prediction
-    remove_object           — drop one object from the scene
-    clear_scene             — drop everything
-
-Representation / coloring:
-    set_representation      — change rep on a scene object
-    set_scheme              — change color scheme on a scene object
-    list_representations    — enumerate available reps
-    list_schemes            — enumerate available schemes
-
-Visualisation:
-    refresh                 — re-render after a change
-    screenshot              — write the current view to PNG
-    center_view             — translate scene so centroid is at origin
-    rotate                  — orbit camera by an angle (deg)
-    spin_start / spin_stop  — auto-orbit on/off (GUI only)
-
-Analysis:
-    detect_hbonds           — list H-bonds in a scene object
-    compute_esp             — ESP stats (min/max/mean potential)
-    get_info                — atom / residue / chain count for an object
-
-Scripting:
-    run_python              — execute Python in the API namespace
+Scene ops:      list_objects, load_pdb, load_docking, load_alphafold,
+                remove_object, clear_scene
+Rep / scheme:   set_representation, set_scheme, list_representations,
+                list_schemes
+Visualisation:  refresh, screenshot, center_view, rotate,
+                spin_start, spin_stop
+Analysis:       detect_hbonds, compute_esp, get_info
+Scripting:      run_python
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
+import json
 import sys
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .api import HeadlessViewport, StudioAPI
 from .core.colors import SCHEME_PRESETS
@@ -247,63 +244,6 @@ def _run_python(api: StudioAPI, code: str) -> List[Dict[str, Any]]:
                  "traceback": traceback.format_exc()}]
 
 
-# ---------------------------------------------------------------------------
-# Server factory
-# ---------------------------------------------------------------------------
-
-def _make_server():
-    """Build an MCP Server wired to a fresh StudioAPI.
-
-    Lazy imports of ``mcp`` so that importing ``protein_studio`` for the
-    GUI doesn't pull in pydantic/uvicorn/etc. The Server constructor
-    takes ``on_list_tools`` and ``on_call_tool`` keyword callbacks in
-    MCP 2.2.0 — the decorator-based FastMCP pattern from older versions
-    is not available here.
-    """
-    from mcp.server import Server
-    from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
-
-    api = StudioAPI(viewport=HeadlessViewport())
-
-    # Convert the catalog dicts into typed Tool objects.
-    typed_tools: List[Tool] = [
-        Tool(
-            name=t["name"],
-            description=t["description"],
-            inputSchema=t["inputSchema"],
-        )
-        for t in TOOL_CATALOG
-    ]
-
-    async def _on_list_tools(ctx, params):
-        # ``params`` is PaginatedRequestParams | None — we return everything.
-        return ListToolsResult(tools=typed_tools)
-
-    async def _on_call_tool(ctx, params):
-        # ``params`` is CallToolRequestParams — has .name and .arguments.
-        name = params.name
-        arguments = dict(params.arguments or {})
-        try:
-            result = _dispatch(name, arguments, api)
-            return _wrap_result(result)
-        except Exception as exc:
-            return CallToolResult(
-                content=[TextContent(
-                    type="text",
-                    text=json_dumps({"error": str(exc),
-                                      "type": type(exc).__name__,
-                                      "traceback": traceback.format_exc()}),
-                )],
-                is_error=True,
-            )
-
-    return Server(
-        "protein-studio",
-        on_list_tools=_on_list_tools,
-        on_call_tool=_on_call_tool,
-    )
-
-
 def _dispatch(name: str, arguments: Dict[str, Any],
               api: StudioAPI) -> Any:
     """Route a tool call to the right StudioAPI method."""
@@ -399,7 +339,6 @@ def _dispatch(name: str, arguments: Dict[str, Any],
         obj = api.scene.find(arguments["name"])
         if obj is None:
             raise KeyError(arguments["name"])
-        # Force esp_surface rep so the mesh has potential data.
         api.set_representation(arguments["name"], "esp_surface")
         api.refresh()
         mesh = api.viewport.plots.get(arguments["name"])
@@ -444,7 +383,6 @@ def _dispatch(name: str, arguments: Dict[str, Any],
 def json_dumps(obj: Any) -> str:
     """Safe JSON dump for tool results — falls back to repr for unknown
     objects (numpy arrays, vtkPolyData, etc.)."""
-    import json
     def _default(o):
         try:
             return o.tolist()
@@ -453,33 +391,124 @@ def json_dumps(obj: Any) -> str:
     return json.dumps(obj, default=_default, ensure_ascii=False)
 
 
-def _wrap_result(result: Any) -> "CallToolResult":
-    """Turn a Python value (dict / list / str / etc.) into the
-    CallToolResult that MCP 2.2.0 expects."""
-    from mcp.types import CallToolResult, TextContent
-    return CallToolResult(
-        content=[TextContent(type="text", text=json_dumps(result))],
-        is_error=False,
-    )
+# ---------------------------------------------------------------------------
+# Server factory (transport-agnostic)
+# ---------------------------------------------------------------------------
+
+def make_server(api: StudioAPI, name: str = "protein-studio"):
+    """Build an MCP Server wired to the given ``api``.
+
+    The returned server is transport-agnostic — pass it to either
+    ``server.run(read, write, ...)`` for stdio or
+    ``server.streamable_http_app()`` for HTTP. The two transports live
+    in :func:`serve_stdio` and :func:`serve_http` below.
+    """
+    from mcp.server import Server
+    from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
+
+    typed_tools: List[Tool] = [
+        Tool(name=t["name"],
+             description=t["description"],
+             inputSchema=t["inputSchema"])
+        for t in TOOL_CATALOG
+    ]
+
+    async def _on_list_tools(ctx, params):
+        return ListToolsResult(tools=typed_tools)
+
+    async def _on_call_tool(ctx, params):
+        name_ = params.name
+        arguments = dict(params.arguments or {})
+        try:
+            result = _dispatch(name_, arguments, api)
+            return CallToolResult(
+                content=[TextContent(type="text", text=json_dumps(result))],
+                is_error=False,
+            )
+        except Exception as exc:
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text=json_dumps({"error": str(exc),
+                                      "type": type(exc).__name__,
+                                      "traceback": traceback.format_exc()}),
+                )],
+                is_error=True,
+            )
+
+    return Server(name,
+                  on_list_tools=_on_list_tools,
+                  on_call_tool=_on_call_tool)
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Transports
 # ---------------------------------------------------------------------------
 
-async def _main():
-    server = _make_server()
+async def serve_stdio() -> None:
+    """Run the MCP server on stdio with a fresh HeadlessViewport.
+
+    Used by ``python -m protein_studio.mcp_server`` for standalone /
+    headless use. The GUI does NOT call this — it uses
+    :func:`serve_http` instead, so the api it controls is the same one
+    the GUI is rendering.
+    """
     from mcp.server.stdio import stdio_server
+
+    api = StudioAPI(viewport=HeadlessViewport())
+    server = make_server(api)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream,
                          server.create_initialization_options())
 
 
+async def serve_http(api: StudioAPI,
+                     host: str = "127.0.0.1",
+                     port: int = 7820,
+                     log_level: str = "warning") -> None:
+    """Run the MCP server bound to the given ``api`` over HTTP.
+
+    External MCP clients (Claude Desktop, Cline, etc.) connect to
+    ``http://host:port/mcp``. The server uses the *passed* api, so any
+    change made through a tool call is immediately reflected in the
+    GUI's scene, and vice versa.
+
+    Designed to be run inside a QThread by the GUI's MCPController:
+
+        await serve_http(api, host="127.0.0.1", port=7820)
+
+    Blocks until cancelled. Cancellation triggers uvicorn's shutdown,
+    which is graceful — in-flight requests get a chance to complete.
+    """
+    import uvicorn
+
+    server = make_server(api)
+    app = server.streamable_http_app()
+    config = uvicorn.Config(app,
+                            host=host,
+                            port=port,
+                            log_level=log_level,
+                            access_log=False)
+    uv_server = uvicorn.Server(config)
+    await uv_server.serve()
+
+
+# ---------------------------------------------------------------------------
+# Entry point (stdio)
+# ---------------------------------------------------------------------------
+
+async def _main_stdio():
+    await serve_stdio()
+
+
 def main() -> int:
-    """Entry point — ``python -m protein_studio.mcp_server``."""
-    import asyncio
+    """Entry point — ``python -m protein_studio.mcp_server``.
+
+    Starts the stdio server. The GUI does not call this; it spawns an
+    in-process HTTP server via :func:`serve_http` instead.
+    """
     try:
-        asyncio.run(_main())
+        asyncio.run(_main_stdio())
     except KeyboardInterrupt:
         pass
     return 0

@@ -90,11 +90,15 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("Ready")
         self.status.addWidget(self._status_label)
 
-        # MCP controller (lazy) — manages a stdio subprocess that
-        # exposes the StudioAPI as 20 MCP tools. Started/stopped via
-        # the Tools menu and the toolbar pill.
+        # MCP controller (in-process HTTP server) — runs uvicorn in a
+        # QThread bound to *this* GUI's StudioAPI, so external MCP
+        # clients can connect to http://127.0.0.1:7820/mcp and see the
+        # same scene the GUI is rendering. Started/stopped via the
+        # Tools menu and the toolbar pill.
         self._mcp = MCPController(self)
+        self._mcp.set_api(api)
         self._mcp.state_changed.connect(self._on_mcp_state_changed)
+        self._mcp.server_url_changed.connect(self._on_mcp_url_changed)
         self._mcp_status_label = QLabel("MCP: stopped")
         self._mcp_status_label.setStyleSheet(
             "QLabel { padding: 2px 10px; border: 1px solid #555; "
@@ -241,7 +245,7 @@ class MainWindow(QMainWindow):
         self._sync_mcp_actions(state)
         # Status-bar pill
         if state == "running":
-            text = "● MCP: running"
+            text = "● MCP: " + (self._mcp.url or "running")
             color = "#5eba7d"
         elif state == "starting":
             text = "● MCP: starting…"
@@ -266,6 +270,11 @@ class MainWindow(QMainWindow):
                 self._mcp_btn.setChecked(state in ("running", "starting"))
             finally:
                 self._mcp_btn.blockSignals(blocker)
+
+    def _on_mcp_url_changed(self, url: str) -> None:
+        """Update the status-bar pill once we know the listening URL."""
+        if self._mcp.state == "running":
+            self._on_mcp_state_changed("running")
 
     def _sync_mcp_actions(self, state: str) -> None:
         """Enable/disable menu actions based on the server state."""

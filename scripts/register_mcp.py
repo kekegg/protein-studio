@@ -19,9 +19,17 @@ B. Register an arbitrary server in the compact "<name>:<command> [args...]"
        python scripts/register_mcp.py --client cherry-studio --client cline \\
            fetch:uvx mcp-server-fetch
 
-C. Just print the bundled protein-studio compact form (no writes)::
+C. Register the protein-studio HTTP transport (recommended for stdio-only
+   clients that support ``type: http``)::
+
+       python scripts/register_mcp.py --http
+
+   Writes ``{"type": "http", "url": "http://127.0.0.1:7820/mcp"}`` entries.
+
+D. Just print the bundled protein-studio compact form (no writes)::
 
        python scripts/register_mcp.py --print
+       python scripts/register_mcp.py --print-http
 
 Supported clients
 -----------------
@@ -33,10 +41,11 @@ Supported clients
 
 Environment variables
 ---------------------
-- ``PROTEIN_STUDIO_PYTHON``  override the bundled Python interpreter
-- ``MCP_CWD``                override the cwd the entry sets on the server
-- ``CLINE_SETTINGS``         override Cline config path (e.g. on Linux)
-- ``CHERRY_STUDIO_SETTINGS`` override Cherry Studio config path
+- ``PROTEIN_STUDIO_MCP_URL``  override the HTTP endpoint (default ``http://127.0.0.1:7820/mcp``)
+- ``PROTEIN_STUDIO_PYTHON``   override the bundled Python interpreter (stdio mode)
+- ``MCP_CWD``                 override the cwd the entry sets on the server
+- ``CLINE_SETTINGS``          override Cline config path (e.g. on Linux)
+- ``CHERRY_STUDIO_SETTINGS``  override Cherry Studio config path
 """
 
 from __future__ import annotations
@@ -55,6 +64,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 DEFAULT_PYTHON = (
     "/opt/homebrew/Caskroom/miniconda/base/envs/protein-studio/bin/python"
 )
+DEFAULT_HTTP_URL = "http://127.0.0.1:7820/mcp"
 SERVER_KEY_PROTEIN_STUDIO = "protein-studio"
 
 
@@ -141,6 +151,26 @@ def _env_block() -> dict:
     return {
         "PYTHONPATH": str(cwd / "src"),
         "QT_QPA_PLATFORM": "offscreen",
+    }
+
+
+def protein_studio_http_url() -> str:
+    """URL the GUI's in-process MCP server listens on."""
+    return os.environ.get("PROTEIN_STUDIO_MCP_URL", DEFAULT_HTTP_URL)
+
+
+def protein_studio_http_entry() -> dict:
+    """Config entry that points an MCP client at the GUI's HTTP server.
+
+    The GUI must already be running with the MCP server started
+    (Tools → Start MCP Server, or the toolbar pill, or ``run_python``
+    from the Python console). The entry is ``{"type": "http",
+    "url": ...}`` — supported by Claude Desktop ≥ 1.0, recent Cline,
+    and Cherry Studio.
+    """
+    return {
+        "type": "http",
+        "url": protein_studio_http_url(),
     }
 
 
@@ -253,9 +283,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--http",
+        action="store_true",
+        help=(
+            "Write an HTTP-transport entry that points clients at the "
+            "GUI's running server (default URL http://127.0.0.1:7820/mcp). "
+            "The GUI must already be running with the MCP server started."
+        ),
+    )
+    p.add_argument(
         "--print",
         action="store_true",
-        help="Print the bundled protein-studio compact form and exit "
+        help="Print the bundled protein-studio compact stdio form and "
+             "exit (no config files are written).",
+    )
+    p.add_argument(
+        "--print-http",
+        action="store_true",
+        help="Print the bundled protein-studio HTTP URL and exit "
              "(no config files are written).",
     )
     p.add_argument(
@@ -305,18 +350,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.print:
         print(protein_studio_compact())
         return 0
+    if args.print_http:
+        print(protein_studio_http_url())
+        return 0
 
-    # Build the entry — either from the bundled protein-studio server,
-    # or from a compact "<name>:<command> [args...]" token.
-    if args.target is None or (
+    # Choose the entry — HTTP, bundled stdio, or arbitrary compact form.
+    if args.http:
+        entry = protein_studio_http_entry()
+    elif args.target is None or (
         args.target in CLIENTS or args.target == "all"
     ):
         entry = protein_studio_entry()
     else:
-        # Compact form — the user may have split it across argv tokens.
-        # Rejoin everything after --client flags into one string.
-        # We rely on argparse having separated --client + --print flags
-        # from the rest, so anything left in target + rest is the form.
         token = args.target
         if args.rest:
             token = token + " " + " ".join(args.rest)
@@ -331,10 +376,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         verb = "updated" if result["had"] else "added"
         print(f"  {verb:<8} {name:<15} {result['config_path']}")
 
-    compact = f"{entry['name']}:{entry['command']} {' '.join(entry['args'])}"
-    print("\nCompact form:")
-    print(f"  {compact}")
-    print("\nRestart the client to pick up the new server.")
+    # Echo the form back so the user can verify.
+    if args.http:
+        print(f"\nHTTP URL: {entry['url']}")
+        print("\nMake sure the GUI is running and the MCP server is "
+              "started (Tools → Start MCP Server).")
+    else:
+        compact = (f"{entry['name']}:{entry['command']} "
+                   f"{' '.join(entry['args'])}")
+        print(f"\nCompact form:\n  {compact}")
+        print("\nRestart the client to pick up the new server.")
     return 0
 
 

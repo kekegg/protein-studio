@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from register_mcp import (  # noqa: E402
     CLIENTS, parse_compact_form, protein_studio_compact,
     protein_studio_entry, entry_from_compact,
+    protein_studio_http_entry, protein_studio_http_url,
     read_json_or_empty, write_json_atomic,
 )
 
@@ -135,3 +136,22 @@ def test_atomic_write_leaves_no_temp_file_on_success(tmp_path: Path):
 def test_supported_clients_match_known_set():
     expected = {"claude-desktop", "cline", "cherry-studio", "continue"}
     assert set(CLIENTS.keys()) == expected
+
+
+# ----- HTTP transport entry ---------------------------------------------
+
+def test_http_entry_default_url():
+    e = protein_studio_http_entry()
+    assert e == {"type": "http", "url": "http://127.0.0.1:7820/mcp"}
+
+
+def test_http_entry_respects_env_override(monkeypatch):
+    monkeypatch.setenv("PROTEIN_STUDIO_MCP_URL",
+                       "http://localhost:9000/mcp")
+    e = protein_studio_http_entry()
+    assert e["url"] == "http://localhost:9000/mcp"
+
+
+def test_http_url_helper_matches_entry(monkeypatch):
+    monkeypatch.delenv("PROTEIN_STUDIO_MCP_URL", raising=False)
+    assert protein_studio_http_url() == protein_studio_http_entry()["url"]
