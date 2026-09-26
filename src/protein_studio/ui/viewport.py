@@ -187,6 +187,63 @@ class ViewportWidget(QWidget):
         self.scene.notify("update")
         self.refresh()
 
+    # --------------------------------------------------------- spin animation
+    def start_spin(self, deg_per_sec: float = 18.0) -> None:
+        """Start a slow auto-rotation of the camera around the vertical
+        (world Z) axis. The protein appears to spin horizontally.
+
+        ``deg_per_sec=18`` is roughly one full turn every 20 seconds —
+        fast enough to be obvious, slow enough not to induce motion
+        sickness.
+        """
+        self.stop_spin()  # avoid double-start
+        from PySide6.QtCore import QTimer
+        interval_ms = max(16, int(1000 / 60))  # 60 fps cap
+        deg_per_tick = deg_per_sec * interval_ms / 1000.0
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(interval_ms)
+        def _tick():
+            try:
+                # PyVista exposes the camera's azimuth as a Python
+                # property; assigning to it rotates the camera around
+                # its focal point. Equivalent to the underlying
+                # vtkCamera.Azimuth() call.
+                self.plotter.camera.azimuth = (
+                    self.plotter.camera.azimuth + deg_per_tick
+                )
+                self.plotter.render()
+            except Exception:
+                self.stop_spin()
+        self._spin_timer.timeout.connect(_tick)
+        self._spin_timer.start()
+        self._spinning = True
+
+    def stop_spin(self) -> None:
+        """Stop the auto-rotation started by :meth:`start_spin`."""
+        timer = getattr(self, "_spin_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+            try:
+                timer.deleteLater()
+            except Exception:
+                pass
+        self._spin_timer = None
+        self._spinning = False
+
+    def toggle_spin(self) -> bool:
+        """Toggle spin on/off. Returns the new state (``True`` = spinning)."""
+        if getattr(self, "_spinning", False):
+            self.stop_spin()
+        else:
+            self.start_spin()
+        return getattr(self, "_spinning", False)
+
+    def is_spinning(self) -> bool:
+        return getattr(self, "_spinning", False)
+
     def update_object(self, name: str, mesh: Any) -> None:
         self._meshes[name] = mesh
         # Re-render only that object

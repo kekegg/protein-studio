@@ -147,10 +147,39 @@ class MainWindow(QMainWindow):
                 "QPushButton:hover { background: #4a4a4a; }"
             )
             tb.addWidget(btn)
+        # Spin button — toggleable, starts/stops slow camera orbit around
+        # the vertical (world Z) axis. Highlighted while active.
+        self._spin_btn = QPushButton("Spin")
+        self._spin_btn.setCheckable(True)
+        self._spin_btn.setStyleSheet(
+            "QPushButton { background: #3a3a3a; color: #dcdcdc; "
+            "padding: 4px 12px; border: 1px solid #555; border-radius: 3px; }"
+            "QPushButton:hover { background: #4a4a4a; }"
+            "QPushButton:checked { background: #3b76c2; color: #fff; "
+            "border: 1px solid #5b96e2; }"
+        )
+        self._spin_btn.toggled.connect(self._on_spin_toggled)
+        tb.addWidget(self._spin_btn)
         tb.addSeparator()
         self._render_label = QLabel("Cartoon")
         self._render_label.setStyleSheet("color: #888; padding: 4px 12px;")
         tb.addWidget(self._render_label)
+
+    def _on_spin_toggled(self, checked: bool) -> None:
+        """Toolbar Spin button handler — start/stop the slow orbit."""
+        if checked:
+            self.viewport.start_spin()
+        else:
+            self.viewport.stop_spin()
+
+    def closeEvent(self, event) -> None:
+        """Make sure the spin QTimer is stopped when the window closes,
+        otherwise it could leak into the next session."""
+        try:
+            self.viewport.stop_spin()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def _build_central(self) -> None:
         # Splitter: outliner | viewport+console | properties
