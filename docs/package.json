@@ -1,0 +1,14 @@
+{
+  "name": "lingsu-protein-docs",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Generates DeveloperGuide/UserGuide docx and pptx for LingSu Protein",
+  "type": "module",
+  "scripts": {
+    "build": "node generate_docs.mjs"
+  },
+  "dependencies": {
+    "docx": "^9.5.0",
+    "pptxgenjs": "^3.12.0"
+  }
+}
