@@ -421,6 +421,15 @@ class ViewportWidget(QWidget):
             # shared/corrupted and colors render as white. We bypass
             # the broken PyVista mapper and install a fresh
             # vtkDataSetMapper with a brand-new vtkLookupTable.
+            #
+            # CRITICAL: when the colors are RGB (3-component per
+            # vertex) and ``rgb=True`` was passed to add_mesh, we must
+            # set ``SetColorModeToDirectScalars()`` so the mapper
+            # reads the components as RGB rather than mapping a single
+            # scalar through the lookup table — the latter would
+            # produce a uniform tinted surface (e.g. all-blue for a
+            # "pale-blue" ESP mesh, because all components happen to
+            # land in the same LUT bucket).
             if last_exc is None and scalars is not None:
                 try:
                     actor = self.plotter.actors.get(name)
@@ -433,13 +442,26 @@ class ViewportWidget(QWidget):
                             new_mapper.SetScalarModeToUseCellData()
                         else:
                             new_mapper.SetScalarModeToUsePointData()
-                        new_mapper.SetScalarVisibility(True)
-                        # Build a brand-new, isolated lookup table per
-                        # actor so no state can leak between actors.
-                        new_lut = vtk.vtkLookupTable()
-                        new_lut.SetNumberOfTableValues(256)
-                        new_lut.Build()
-                        new_mapper.SetLookupTable(new_lut)
+                        # If the chosen scalar array has 3 components
+                        # (RGB) we set direct-scalars mode so VTK uses
+                        # the components as colors directly. For 1- or
+                        # 4-component arrays we still use the LUT path
+                        # (the standard way for non-RGB scalars).
+                        try:
+                            arr = (sub.cell_data if "cell" in preference
+                                   else sub.point_data)[scalars]
+                            if arr.shape[-1] == 3:
+                                new_mapper.SetColorModeToDirectScalars()
+                            else:
+                                new_mapper.SetScalarVisibility(True)
+                                # Build a brand-new, isolated lookup
+                                # table per actor so no state can leak.
+                                new_lut = vtk.vtkLookupTable()
+                                new_lut.SetNumberOfTableValues(256)
+                                new_lut.Build()
+                                new_mapper.SetLookupTable(new_lut)
+                        except Exception:
+                            new_mapper.SetScalarVisibility(True)
                         actor.SetMapper(new_mapper)
                 except Exception as exc:
                     print(

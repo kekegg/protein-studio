@@ -1242,7 +1242,7 @@ def esp_surface(
     scale_factor: float = 2.0,
     decay: float = 1.5,
     min_distance: float = 0.7,
-    range_kcal: float = 5.0,
+    range_kcal: float = 0.1,
     include_hetero: bool = False,
 ) -> "object":
     """Molecular surface colored by approximate electrostatic potential.
