@@ -119,6 +119,25 @@ class Scene:
 
     # ----------------------------------------------------------- basic ops
     def add(self, obj: SceneObject) -> None:
+        # Deduplicate by name: if an object with the same name is
+        # already in the scene, replace it in place. This avoids
+        # subtle bugs when the user opens the same PDB twice (or
+        # auto-loads 1aki at startup then loads it again) — without
+        # this we'd silently end up with two objects sharing the
+        # same name, only one of which actually gets rendered (the
+        # second ``plotter.add_mesh(name=...)`` call overwrites the
+        # first actor), and the user sees the "old" version with
+        # colours from a stale viewport state.
+        for i, existing in enumerate(self.objects):
+            if existing.name == obj.name:
+                # Preserve active_name if it was pointing at the
+                # object being replaced.
+                was_active = self.active_name == existing.name
+                self.objects[i] = obj
+                if was_active:
+                    self.active_name = obj.name
+                self._emit("update", obj)
+                return
         self.objects.append(obj)
         if self.active_name is None:
             self.active_name = obj.name

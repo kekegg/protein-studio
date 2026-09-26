@@ -165,6 +165,95 @@ def test_api_load_and_refresh():
     assert api.scene.n_objects() == 0
 
 
+def test_scene_add_dedupes_by_name():
+    """Loading a PDB twice (or loading a protein after auto-load)
+    must not produce two scene objects with the same name — only
+    one should remain, and it should be the most recently added."""
+    from protein_studio.core.scene import Scene, SceneObject
+    from protein_studio.core.io import load_pdb
+    from protein_studio.core.colors import SCHEME_PRESETS
+    scene = Scene()
+    mol1 = load_pdb(EXAMPLES / "1ubq.pdb")
+    mol2 = load_pdb(EXAMPLES / "1ubq.pdb")
+    # Sanity: the molecules are different instances.
+    assert mol1 is not mol2
+    obj1 = SceneObject(name="1ubq", molecule=mol1,
+                       representation="ribbon",
+                       color_scheme=SCHEME_PRESETS["secondary"])
+    obj2 = SceneObject(name="1ubq", molecule=mol2,
+                       representation="cartoon",
+                       color_scheme=SCHEME_PRESETS["element"])
+    scene.add(obj1)
+    scene.add(obj2)
+    assert scene.n_objects() == 1
+    only = scene.objects[0]
+    assert only is obj2, "second add() should replace, not append"
+    assert only.representation == "cartoon"
+    assert only.molecule is mol2
+
+
+def test_scene_add_dedupes_keeps_active_selection():
+    """When the replaced object was the active one, active_name
+    should follow the new object so the Properties panel still
+    shows a valid selection."""
+    from protein_studio.core.scene import Scene, SceneObject
+    from protein_studio.core.io import load_pdb
+    from protein_studio.core.colors import SCHEME_PRESETS
+    scene = Scene()
+    mol1 = load_pdb(EXAMPLES / "1ubq.pdb")
+    mol2 = load_pdb(EXAMPLES / "1ubq.pdb")
+    obj1 = SceneObject(name="1ubq", molecule=mol1,
+                       representation="ribbon",
+                       color_scheme=SCHEME_PRESETS["secondary"])
+    scene.add(obj1)
+    scene.set_active(obj1.name)
+    assert scene.active_name == "1ubq"
+    obj2 = SceneObject(name="1ubq", molecule=mol2,
+                       representation="cartoon",
+                       color_scheme=SCHEME_PRESETS["element"])
+    scene.add(obj2)
+    assert scene.active_name == "1ubq"
+    assert scene.active is obj2
+
+
+def test_api_load_pose_then_protein_no_duplicates():
+    """Reproduce the user-reported bug: load a docking pose first,
+    then load a protein via ``api.load``. The protein must end up
+    as exactly one object — no duplicate from the auto-loaded
+    1aki at startup."""
+    api = StudioAPI(viewport=HeadlessViewport())
+    # Simulate auto-load at startup
+    protein_obj = api.load(EXAMPLES / "1aki.pdb",
+                           representation="ribbon", scheme="secondary")
+    # Now load a docking pose (mock: just add a fake ligand object)
+    from protein_studio.core.scene import SceneObject
+    from protein_studio.core.molecule import Molecule
+    from protein_studio.core.colors import ColorScheme
+    ligand = Molecule(name="ligand")
+    pose_obj = SceneObject(name="pose_1_ligand", molecule=ligand,
+                           representation="ball_and_stick",
+                           color_scheme=ColorScheme(
+                               name="rank", key="uniform",
+                               uniform=(1.0, 0.5, 0.0)))
+    api.scene.add(pose_obj)
+    assert api.scene.n_objects() == 2
+    # Now re-load the protein (same name "1aki" as the auto-load)
+    api.load(EXAMPLES / "1aki.pdb",
+             representation="ribbon", scheme="secondary")
+    # Critical assertion: must still be 2 objects (not 3 — that
+    # would mean a duplicate "1aki" was created).
+    assert api.scene.n_objects() == 2, (
+        f"expected 2 scene objects (1 protein + 1 pose), got "
+        f"{api.scene.n_objects()}: {[o.name for o in api.scene.objects]}"
+    )
+    names = sorted(o.name for o in api.scene.objects)
+    assert names == ["1aki", "pose_1_ligand"]
+    # And the 1aki must be the newly-loaded one, not the original.
+    one_aki = [o for o in api.scene.objects if o.name == "1aki"][0]
+    assert one_aki is not protein_obj
+    assert one_aki.molecule is not protein_obj.molecule
+
+
 def test_api_set_representation_and_scheme():
     api = StudioAPI(viewport=HeadlessViewport())
     obj = api.load(EXAMPLES / "1ubq.pdb")
