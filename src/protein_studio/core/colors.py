@@ -113,7 +113,7 @@ _CHAIN_PALETTE = (
 class ColorScheme:
     """A named color scheme that maps a per-atom key to an RGB color."""
     name: str
-    key: str  # "element" | "residue" | "chain" | "secondary" | "bfactor" | "uniform"
+    key: str  # "element" | "residue" | "chain" | "secondary" | "bfactor" | "uniform" | "electrostatic"
     uniform: tuple[float, float, float] = (0.80, 0.80, 0.80)
     bfactor_range: tuple[float, float] = (0.0, 100.0)
 
@@ -136,6 +136,11 @@ class ColorScheme:
             t = max(0.0, min(1.0, t))
             # Blue (low) -> white (mid) -> red (high)
             return _bfactor_color(t)
+        if self.key == "electrostatic":
+            # Per-atom electrostatic color is meaningless — fall back to
+            # uniform. The rep function (esp_surface) handles per-vertex
+            # potential → RWB coloring when this scheme is active.
+            return self.uniform
         return self.uniform
 
 
@@ -150,12 +155,13 @@ def _bfactor_color(t: float) -> tuple[float, float, float]:
 
 # Color schemes selectable from the UI
 SCHEME_PRESETS: Dict[str, ColorScheme] = {
-    "uniform":   ColorScheme("Uniform",   "uniform",   uniform=(0.80, 0.80, 0.85)),
-    "element":   ColorScheme("Element",   "element"),
-    "residue":   ColorScheme("Residue",   "residue"),
-    "chain":     ColorScheme("Chain",     "chain"),
-    "secondary": ColorScheme("Secondary", "secondary"),
-    "bfactor":   ColorScheme("B-factor",  "bfactor"),
+    "uniform":       ColorScheme("Uniform",       "uniform",   uniform=(0.80, 0.80, 0.85)),
+    "element":       ColorScheme("Element",       "element"),
+    "residue":       ColorScheme("Residue",       "residue"),
+    "chain":         ColorScheme("Chain",         "chain"),
+    "secondary":     ColorScheme("Secondary",     "secondary"),
+    "bfactor":       ColorScheme("B-factor",      "bfactor"),
+    "electrostatic": ColorScheme("Electrostatic", "electrostatic"),
 }
 
 

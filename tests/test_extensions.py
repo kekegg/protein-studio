@@ -108,6 +108,60 @@ def test_vdw_surface_tighter_than_ses():
         )
 
 
+def test_electrostatic_scheme_is_registered():
+    """The 'electrostatic' scheme must be available in the UI dropdown
+    so users can pick red-white-blue ESP coloring for surface reps."""
+    from protein_studio.core.colors import SCHEME_PRESETS
+    assert "electrostatic" in SCHEME_PRESETS
+    s = SCHEME_PRESETS["electrostatic"]
+    assert s.key == "electrostatic"
+    assert s.name == "Electrostatic"
+
+
+def test_electrostatic_scheme_colors_surface_rwb():
+    """When the user picks the electrostatic scheme, surface meshes
+    must be colored by the red-white-blue ESP gradient (not per-atom
+    uniform gray)."""
+    from protein_studio.core.representations import surface
+    from protein_studio.core.colors import SCHEME_PRESETS
+    mol = load_pdb(EXAMPLES / "1ubq.pdb")
+    mesh = surface(mol, surface_type="MS", scale_factor=2.0,
+                   scheme=SCHEME_PRESETS["electrostatic"])
+    # Should carry per-vertex potential and non-uniform RGB colors.
+    assert "potential" in (mesh.point_data.keys() or [])
+    pot = mesh.point_data["potential"]
+    assert pot.std() > 0.01, "potential field is flat — Coulomb sum broken?"
+    colors = mesh.point_data["colors"]
+    # Surface must have a non-trivial gradient: red+blue+white colors
+    # all present (red pixels: R>>G,B; blue: B>>R,G; white: ~equal).
+    n_red = ((colors[:, 0] > colors[:, 1] + 0.1) &
+             (colors[:, 0] > colors[:, 2] + 0.1)).sum()
+    n_blue = ((colors[:, 2] > colors[:, 0] + 0.1) &
+              (colors[:, 2] > colors[:, 1] + 0.1)).sum()
+    n_white = ((np.abs(colors[:, 0] - colors[:, 1]) < 0.1) &
+               (np.abs(colors[:, 1] - colors[:, 2]) < 0.1)).sum()
+    assert n_red > 0, "no red (negative-potential) vertices"
+    assert n_blue > 0, "no blue (positive-potential) vertices"
+    assert n_white > 0, "no white (neutral-potential) vertices"
+
+
+def test_electrostatic_scheme_honors_element_when_picked():
+    """If the user is on the surface rep but picks a non-electrostatic
+    scheme (e.g. element), the surface must be colored by atom
+    element — the electrostatic scheme must not be sticky."""
+    from protein_studio.core.representations import surface
+    from protein_studio.core.colors import SCHEME_PRESETS, color_for_element
+    mol = load_pdb(EXAMPLES / "1ubq.pdb")
+    mesh = surface(mol, surface_type="MS", scale_factor=2.0,
+                   scheme=SCHEME_PRESETS["element"])
+    # Element scheme should produce non-uniform colors with a few
+    # distinct hues — at least the C/O/N colors are present.
+    distinct = {tuple((c * 30).astype(int)) for c in mesh.point_data["colors"]}
+    assert len(distinct) >= 3, (
+        f"element-colored surface should have multiple hues; got {len(distinct)}"
+    )
+
+
 def test_esp_surface_returns_points_and_potential():
     mol = load_pdb(EXAMPLES / "1ubq.pdb")
     pts, pot = compute_esp_surface(mol, config=ESPConfig(n_sample_points=300))

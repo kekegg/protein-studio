@@ -1123,7 +1123,17 @@ def surface(
     The resulting mesh has per-vertex colors from *scheme* plus a
     ``atom_id`` point-data array mapping each vertex to its nearest
     atom (useful for downstream property coloring, including ESP).
+
+    Note
+    ----
+    If the user picks the ``electrostatic`` color scheme but stays
+    on the ``surface`` rep (rather than ``esp_surface``), there is
+    no per-vertex potential to color by — we fall back to a neutral
+    uniform gray and set ``point_data["potential"] = 0`` so the
+    ESP-aware scheme has something to look at. Use the
+    ``esp_surface`` rep for the actual red-white-blue coloring.
     """
+    from .charges import assign_partial_charges, esp_to_rgb
     from .surface import (
         generate_ses_surface,
         SURFACE_MS, SURFACE_SAS, SURFACE_VDW,
@@ -1161,9 +1171,29 @@ def surface(
         return pv.PolyData()
 
     mesh = pv.PolyData(result.vertices, faces=_tri_flat(result.faces))
-    # Per-vertex colour from the scheme — use atom_id to look up the
-    # scheme colour of the nearest atom.
-    colors = np.array([scheme.color(atoms[i]) for i in result.atom_id])
+
+    # Decide coloring. If the user asked for electrostatic but we're
+    # on the plain ``surface`` rep, compute the Coulomb sum inline so
+    # they still get the RWB gradient — otherwise the surface mesh
+    # would just come out uniform gray with no way to opt in.
+    if scheme.key == "electrostatic":
+        q_mol = assign_partial_charges(mol)
+        q = q_mol[atom_idx_in_mol]
+        verts = result.vertices
+        diff = verts[:, None, :] - coords[None, :, :]
+        dist = np.maximum(np.linalg.norm(diff, axis=2), 0.7)
+        pot = (q[None, :] / np.power(dist, 1.5)).sum(axis=1)
+        # Saturation point: 0.1 e·Å⁻¹ maps to ±1 — gives a visually
+        # rich ESP on typical proteins where the raw Coulomb sum
+        # peaks around ±0.1 e·Å⁻¹.
+        pot = np.tanh(pot / 0.1)
+        colors = esp_to_rgb(pot)
+        mesh.point_data["potential"] = pot
+    else:
+        # Per-vertex colour from the scheme — use atom_id to look up
+        # the scheme colour of the nearest atom.
+        colors = np.array([scheme.color(atoms[i]) for i in result.atom_id])
+
     mesh.point_data["colors"] = colors
     mesh.point_data["atom_id"] = result.atom_id
     # Smooth shading requires vertex normals
@@ -1228,8 +1258,15 @@ def esp_surface(
            V(r) = Σᵢ qᵢ / max(|r - rᵢ|, min_distance) ^ decay
 
        where qᵢ is the AMBER partial charge of atom i.
-    4. Map V to a red-white-blue gradient (negative → red, neutral →
-       white, positive → blue) via :func:`charges.esp_to_rgb`.
+    4. Pick a coloring scheme:
+
+         - If ``scheme.key == "electrostatic"`` (or no scheme given),
+           map V to a red-white-blue gradient via
+           :func:`charges.esp_to_rgb`. This is the default.
+         - Otherwise, color each vertex by the scheme's per-atom
+           color (so users can paint the ESP surface by element /
+           residue / chain / secondary / bfactor / uniform and
+           still get the underlying per-vertex ``potential`` data).
 
     Parameters
     ----------
@@ -1289,11 +1326,19 @@ def esp_surface(
     # Saturate via tanh
     pot = np.tanh(pot / range_kcal)
 
-    # 4) RGB
-    rgb = esp_to_rgb(pot)
+    # 4) RGB — pick coloring based on scheme
+    if scheme is None or scheme.key == "electrostatic":
+        # Default for the esp_surface rep: red-white-blue ESP gradient.
+        rgb = esp_to_rgb(pot)
+    else:
+        # Honor the user's scheme (element / residue / chain / ...):
+        # color each vertex by its nearest atom's scheme color.
+        rgb = np.array([scheme.color(atoms[i]) for i in ses.atom_id])
 
     mesh = pv.PolyData(verts, faces=_tri_flat(ses.faces))
     mesh.point_data["colors"] = rgb
+    # Always keep the per-vertex potential so users can switch to
+    # electrostatic scheme later without rebuilding the surface.
     mesh.point_data["potential"] = pot
     mesh.point_data["atom_id"] = ses.atom_id
     try:
