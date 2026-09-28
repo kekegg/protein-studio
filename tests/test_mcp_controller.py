@@ -104,6 +104,19 @@ def _wait_for_state(ctl: MCPController, target: str,
 
 def _http_post(url: str, payload: dict,
                session_id: list[str], timeout: float = 10.0) -> dict:
+    """Send a JSON-RPC POST and return the decoded result.
+
+    The MCP server runs on the GUI thread (a QTcpServer). For it to
+    actually read bytes off the wire and send a response, the Qt
+    event loop has to be running *while* we're waiting for the HTTP
+    reply. ``urllib.request.urlopen`` is synchronous and would block
+    the test thread — which is the same thread the QTcpServer's
+    readyRead signal must be delivered on. So we run the blocking
+    urlopen in a worker thread and pump Qt events from the main
+    thread until the worker finishes.
+    """
+    import threading
+
     body = json.dumps(payload).encode()
     headers = {
         "Content-Type": "application/json",
@@ -111,22 +124,65 @@ def _http_post(url: str, payload: dict,
     }
     if session_id[0]:
         headers["mcp-session-id"] = session_id[0]
-    req = urllib.request.Request(url, data=body, method="POST",
-                                 headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        sid = resp.headers.get("mcp-session-id")
-        if sid:
-            session_id[0] = sid
-        ctype = resp.headers.get("Content-Type", "")
-        raw = resp.read().decode()
-        if "text/event-stream" in ctype:
-            for chunk in raw.split("\n\n"):
-                for line in chunk.splitlines():
-                    if line.startswith("data:"):
-                        return json.loads(line[len("data:"):].strip())
-        if not raw:
-            return {}
-        return json.loads(raw)
+
+    result: dict = {"ok": False}
+    error: list = [None]
+
+    def _worker():
+        try:
+            req = urllib.request.Request(url, data=body, method="POST",
+                                         headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                sid = resp.headers.get("mcp-session-id")
+                if sid:
+                    session_id[0] = sid
+                ctype = resp.headers.get("Content-Type", "")
+                raw = resp.read().decode()
+                if "text/event-stream" in ctype:
+                    for chunk in raw.split("\n\n"):
+                        for line in chunk.splitlines():
+                            if line.startswith("data:"):
+                                result["data"] = json.loads(
+                                    line[len("data:"):].strip())
+                                result["ok"] = True
+                                return
+                if not raw:
+                    result["data"] = {}
+                    result["ok"] = True
+                    return
+                result["data"] = json.loads(raw)
+                result["ok"] = True
+        except Exception as e:  # noqa: BLE001
+            error[0] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+    # Pump Qt events until the worker finishes (or we hit a hard
+    # timeout). The timeout here is generous — workers typically
+    # return in well under a second once the loop is pumping.
+    deadline_ms = int(timeout * 1000) + 5000
+    loop = QEventLoop()
+    QTimer.singleShot(deadline_ms, loop.quit)
+
+    def _check():
+        if not t.is_alive():
+            loop.quit()
+    poll = QTimer()
+    poll.setInterval(20)
+    poll.timeout.connect(_check)
+    poll.start()
+    loop.exec()
+    poll.stop()
+
+    if error[0] is not None:
+        raise error[0]
+    if not result["ok"]:
+        raise RuntimeError(
+            f"_http_post timed out after {deadline_ms}ms — the GUI "
+            f"thread may not be processing QTcpServer readyRead signals"
+        )
+    return result["data"]
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +295,8 @@ def test_log_snapshot_records_start(qt_app):
     _wait_for_state(ctl, "running", timeout_ms=15000)
     try:
         snap = ctl.log_snapshot()
-        assert "starting MCP HTTP server" in snap, snap
+        assert "starting GUI-thread server" in snap, snap
+        assert "ready at" in snap, snap
         assert str(ctl._port) in snap
     finally:
         ctl.stop()

@@ -181,68 +181,38 @@ def test_shutdown_calls_enabled_off_on_axes_widget(qt_app):
         "shutdown() must disable the orientation marker widget"
 
 
-def test_finalizer_skips_when_no_gl_context(qt_app):
-    """The weakref.finalize callback must NOT call ``EnabledOff``
-    when no GL context is current — that's the crash scenario the
-    agent reported. Instead it queues a single-shot on the GUI
-    thread, where the QOpenGLWidget's context *is* current.
-
-    We simulate the missing-context path by monkey-patching
-    ``QOpenGLContext.currentContext`` to return None and verify
-    that EnabledOff was NOT called synchronously. (We don't try to
-    fire the queued event here — headless Qt's processEvents doesn't
-    drain QTimer events with 0 ms delay.)
-    """
+def test_finalizer_always_calls_enabled_off_and_swallows(qt_app):
+    """The weakref.finalize callback unconditionally calls
+    ``EnabledOff`` and swallows any exception. The earlier
+    "skip when no GL context" branch was the *cause* of the segfault
+    the user reported: bouncing onto the GUI thread via
+    ``QTimer.singleShot(0, ...)`` ran ``glDeleteBuffers`` against a
+    context already in mid-render. The new contract: try the
+    cleanup synchronously, swallow any exception. We verify both
+    halves with a fake widget — one that raises and one that
+    counts."""
     from protein_studio.ui import viewport as vp_mod
 
-    class FakeWidget:
+    class CountingWidget:
         def __init__(self):
             self.calls = 0
         def EnabledOff(self):
             self.calls += 1
 
-    w = FakeWidget()
-    from PySide6.QtGui import QOpenGLContext
-    orig = QOpenGLContext.currentContext
-    QOpenGLContext.currentContext = staticmethod(lambda: None)  # type: ignore
-    try:
-        vp_mod._safe_axes_finalizer(w)
-    finally:
-        QOpenGLContext.currentContext = orig  # type: ignore
+    # Happy path: EnabledOff runs and the count increments.
+    w_ok = CountingWidget()
+    vp_mod._safe_axes_finalizer(w_ok)
+    assert w_ok.calls == 1, (
+        f"finalizer should call EnabledOff exactly once on a happy "
+        f"widget, got {w_ok.calls} calls"
+    )
 
-    assert w.calls == 0, (
-        "EnabledOff must not run synchronously on the no-context path "
-        "— that's the use-after-free crash we're guarding against")
-
-
-def test_finalizer_calls_when_context_present(qt_app):
-    """When a GL context *is* current, the finalizer calls
-    ``EnabledOff`` immediately — the cheap path."""
-    from protein_studio.ui import viewport as vp_mod
-
-    class FakeWidget:
-        def __init__(self):
-            self.calls = 0
+    # Error path: EnabledOff raises, but the finalizer must NOT
+    # propagate the exception (would abort Qt's weakref.finalize
+    # and leak the VTK object).
+    class RaisingWidget:
         def EnabledOff(self):
-            self.calls += 1
+            raise RuntimeError("simulated VTK shutdown failure")
 
-    w = FakeWidget()
-    # In headless / offscreen Qt there is no real GL context. The
-    # "context present" branch is what production hits when the
-    # finalizer runs on the GUI thread (where the QOpenGLWidget's
-    # context is current). We just verify that, when a context IS
-    # reported, EnabledOff runs. In offscreen mode currentContext()
-    # returns None, so we can't exercise that branch here directly;
-    # the test is here for documentation / future CI on real GL.
-    #
-    # Instead, directly verify the inverse: when the real current
-    # context is reported as None, EnabledOff is NOT called.
-    from PySide6.QtGui import QOpenGLContext
-    if QOpenGLContext.currentContext() is not None:
-        vp_mod._safe_axes_finalizer(w)
-        assert w.calls == 1
-    else:
-        # Same assertion as the other test, sanity-check both branches
-        # are coded.
-        vp_mod._safe_axes_finalizer(w)
-        assert w.calls == 0
+    w_bad = RaisingWidget()
+    vp_mod._safe_axes_finalizer(w_bad)  # must not raise

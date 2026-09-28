@@ -244,15 +244,29 @@ class ViewportWidget(QWidget):
         self._actors.clear()
         # Drop our previously-rendered actors only — leave axes, lights,
         # camera, scalar bar untouched.
-        owned_bases = {o.name for o in self.scene.objects}
+        # Build a quick lookup {name: SceneObject} so the per-actor
+        # branch below can also see the current ``visible`` flag.
+        # Without this, toggling the eye-checkbox in the outliner
+        # updated the scene but left the corresponding VTK actor in
+        # the renderer's pipeline — so the supposedly-hidden pose
+        # kept drawing. (See fix-viewport-visible-toggle.)
+        owned_objs = {o.name: o for o in self.scene.objects}
         if hasattr(self.plotter, "actors"):
             for actor_name in list(self.plotter.actors.keys()):
                 # We only own actors whose names are scene object names
                 # or our `name:atoms` / `name:bonds` sub-names. When the
                 # scene is empty, remove ALL of them; otherwise only
-                # remove actors whose base is no longer in the scene.
+                # remove actors whose base is no longer in the scene
+                # OR whose corresponding scene object has just been
+                # hidden via the outliner checkbox.
                 base = actor_name.split(":", 1)[0]
-                if not owned_bases or base not in owned_bases:
+                base_obj = owned_objs.get(base)
+                should_remove = (
+                    not owned_objs
+                    or base not in owned_objs
+                    or (base_obj is not None and not base_obj.visible)
+                )
+                if should_remove:
                     try:
                         self.plotter.remove_actor(actor_name)
                     except Exception:

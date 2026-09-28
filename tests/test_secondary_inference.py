@@ -1,19 +1,27 @@
-"""Tests for core/secondary.py (Ramachandran-based SS inference).
+"""Tests for core/secondary.py (H-bond-based SS inference).
 
 The bug: PDB files without HELIX/SHEET records (e.g. deposited
 snapshots, docked structures, homology models) leave every residue
 with ``secondary_structure = "unknown"``. The ``secondary`` colour
 scheme then paints the whole protein in flat gray.
 
-The fix: a Ramachandran-based inference in core/secondary.py runs
+The fix: a backbone-H-bond-based inference in core/secondary.py runs
 during ``load_pdb`` after the explicit HELIX/SHEET pass and fills in
-the unknown residues with helix / sheet / loop based on φ/ψ.
+the unknown residues with helix / sheet / loop. The algorithm is a
+direct port of 3Dmol.js's ``computeSecondaryStructure`` +
+``assignBackboneHBonds``: a residue is a helix if it has an N...O
+contact to residue ±4; a residue is sheet if paired with another
+sheet candidate; singletons get demoted to loop; short runs get
+trimmed. φ/ψ remains as a fallback for chain ends that lack an
+H-bond partner.
 
 These tests verify:
   - Load a PDB with no HELIX/SHEET (src_protein.pdb) → residues get
     classified into multiple SS types, not all gray.
   - Load a PDB with HELIX/SHEET (1aki.pdb) → those stay authoritative
     (HELIX/SHEET records aren't overwritten).
+  - The min-run-length filter drops short runs (DSSP minimum: 4
+    helix, 3 sheet) and keeps long ones.
   - Special residue handling: PRO/GLY get classified correctly even
     when their φ lands outside the standard α/β regions.
   - The colour scheme 'secondary' produces > 1 distinct colour on a
@@ -273,11 +281,12 @@ def test_infer_secondary_structure_basic():
     """Use real 1aki residues (which have actual N/CA/C atoms with
     coordinates) and verify the inference classifies them. Since 1aki
     has HELIX/SHEET records, we wipe them first to test the inference
-    on its own. The post-prune filter will demote any short helix
-    runs (1-2 residues) to loop, so we expect the inference to leave
-    mostly loop-classified residues behind — that's correct: the
-    φ/ψ-based classifier can't reliably produce runs of 4+ on its
-    own without H-bond detection (which DSSP uses).
+    on its own.
+
+    The H-bond based algorithm should reproduce a substantial fraction
+    of 1aki's helices and sheets: 1aki is a mostly-α protein with a
+    small β-sheet, and a high-resolution structure has well-defined
+    backbone H-bonds for both.
     """
     mol = load_pdb("examples/1aki.pdb")
     # Reset every residue to "unknown" so the inference is the only
@@ -286,20 +295,33 @@ def test_infer_secondary_structure_basic():
         r.secondary_structure = "unknown"
 
     n = infer_secondary_structure(mol)
-    # 1aki is mostly α-helix, so most interior residues should classify
-    # as something (loop / helix / sheet). The two terminal residues
-    # of each chain stay unknown.
+    # 1aki has 129 residues across 2 chains; interior residues have
+    # both N and O so H-bond detection can run on them.
     assert n > 100, f"only {n} residues classified"
 
     chain = mol.chains[0]
     classified = [r.secondary_structure for r in chain.residues
                   if r.secondary_structure != "unknown"]
-    # The inference classified something — even if the post-prune
-    # filter demotes scattered short runs, we should see loop as
-    # the dominant class (because short scattered "helix" runs get
-    # demoted to loop).
-    assert "loop" in classified, (
-        f"inference didn't classify any residues as loop: {classified}"
+    # 1aki is a 7-helix bundle. The H-bond algorithm should find at
+    # least 5 of those long helix runs.
+    helix_runs = []
+    cur = None
+    for r in chain.residues:
+        if r.secondary_structure == "helix":
+            if cur is None:
+                cur = [r.number, r.number]
+            else:
+                cur[1] = r.number
+        else:
+            if cur is not None:
+                helix_runs.append(tuple(cur))
+                cur = None
+    if cur is not None:
+        helix_runs.append(tuple(cur))
+    long_helices = [r for r in helix_runs if r[1] - r[0] + 1 >= 4]
+    assert len(long_helices) >= 3, (
+        f"inference didn't find at least 3 long helix runs in 1aki, "
+        f"got {helix_runs}"
     )
 
 
@@ -349,12 +371,11 @@ def _runs_of(mol, ss_name):
 
 
 def test_min_run_length_filter_drops_short_helices():
-    """src_protein's SS inference produces 23 short helix runs (avg
-    1.3 residues); the Gaussian smoothing in the ribbon rep washes
-    them into the surrounding loop, so the user sees flat strips
-    where they expect a cylinder. The DSSP-minimum filter demotes
-    any helix run shorter than 4 residues to loop, leaving only
-    geometrically meaningful helices."""
+    """The DSSP-minimum filter demotes any helix run shorter than 4
+    residues to loop. With the H-bond algorithm src_protein yields
+    9 real α-helix runs (307-317, 345-352, 359-380, 430-437, 441-459,
+    462-465, 467-478, 488-499, 507-519) — every one of them >= 4
+    residues, none demoted."""
     mol = load_pdb("examples/src_protein.pdb")
     runs = _runs_of(mol, "helix")
     # Every remaining helix run must be >= 4 residues long (DSSP).
@@ -363,13 +384,13 @@ def test_min_run_length_filter_drops_short_helices():
             f"helix run {start}-{end} ({end - start + 1} res) is shorter "
             f"than the DSSP minimum — it should have been demoted"
         )
-    # Before the fix this protein had 31 helix residues spread across
-    # 23 runs (avg 1.3 res). After the fix most of those are loop,
-    # leaving only real helix segments.
-    total_helix_res = sum(end - start + 1 for start, end in runs)
-    assert total_helix_res < 31, (
-        f"filter did not trim noisy short helix runs (still "
-        f"{total_helix_res} helix residues)"
+    # The H-bond algorithm should find the real helices, not noise:
+    # we expect a handful of long runs (≥ 5), each well over the
+    # DSSP minimum. Sanity check the algorithm isn't producing tons
+    # of short runs that slipped past the filter.
+    assert 3 <= len(runs) <= 20, (
+        f"expected ~10 helix runs on src_protein, got {len(runs)}: "
+        f"{runs}"
     )
 
 

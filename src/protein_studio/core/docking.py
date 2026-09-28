@@ -47,6 +47,54 @@ class DockingPose:
 # ---------------------------------------------------------------- PDBQT
 
 
+# Map Vina's PDBQT atom-type field (the trailing ``<charge> <type>``
+# pair AutoDock Vina writes after column 66) to the chemical element.
+# The PDB element column (77-78) is usually blank in Vina output, so
+# we recover the real element from the type token. Single-letter
+# ambiguous types (``A``/``C``/``F``/``H``/``N``/``O``/``P``/``S``)
+# map to a single element; two-letter halogen types and Vina's
+# H-bond variants (``NA``/``OA``/``SA``/``HD``/``HS``) also map
+# cleanly. Without this table most ligand atoms fall back to
+# ``color_for_element("A")`` and render as a single gray fallback,
+# which is what was making every docked pose look monochrome.
+_VINA_TYPE_TO_ELEMENT = {
+    "C":  "C", "A":  "C",
+    "N":  "N", "NA": "N", "NS": "N",
+    "O":  "O", "OA": "O", "OS": "O",
+    "S":  "S", "SA": "S",
+    "H":  "H", "HD": "H", "HS": "H",
+    "F":  "F", "Cl": "Cl", "Br": "Br", "I": "I",
+    "P":  "P",
+}
+
+
+def _element_from_pdbqt(L: str, name: str) -> str:
+    """Recover the chemical element from a Vina PDBQT line.
+
+    AutoDock Vina writes the ``<charge> <atom_type>`` pair (where
+    ``atom_type`` is e.g. ``A``/``C``/``NA``/``HD``/``Cl``) into the
+    trailing whitespace + element column of the PDB line. The token
+    that ends up in columns 77-78 of the output is just the last
+    column of the atom-type field — which is ``"A"`` for aromatic
+    carbons, ``"C"`` for aliphatic, ``"N"`` for nitrogen, and so on.
+    That token IS the Vina atom type, not the chemical element, so
+    we can't trust the PDB element column for Vina output at all.
+
+    We always read the **last whitespace-separated token** of the
+    line, look it up in the Vina-type table, and fall back to the
+    first letter of the atom name only if the type isn't recognised
+    (e.g. custom non-Vina PDBQT dialects).
+    """
+    tail = L.rstrip().split()[-1] if L.rstrip() else ""
+    if tail in _VINA_TYPE_TO_ELEMENT:
+        return _VINA_TYPE_TO_ELEMENT[tail]
+    if tail:
+        # Unknown Vina type — best-effort: first char upper-cased.
+        return tail[0].upper()
+    nm = name.strip()
+    return nm[0].upper() if nm else "X"
+
+
 def _pdbqt_to_pdb_atom_line(line: str) -> Optional[str]:
     """Convert a Vina PDBQT ATOM/HETATM line to PDB ATOM format.
 
@@ -85,20 +133,54 @@ def _pdbqt_to_pdb_atom_line(line: str) -> Optional[str]:
     z       = L[46:54]
     occ     = (L[54:60] or "  1.00").strip() or "1.00"
     bfac    = (L[60:66] or "  0.00").strip() or "0.00"
-    elem    = (L[76:78] or "").strip()
-    if not elem:
-        elem = name.strip()[0] if name.strip() else "X"
+    elem = _element_from_pdbqt(L, name)
 
+    # Build a real 80-column PDB line that matches the column
+    # layout the load_pdb reader expects. The reader's column map is
+    # based on the standard PDB v3.3 layout:
+    #   1-6   rec      7-11  serial   13-16 name    17    altLoc
+    #   18-20 resName  22    chainID  23-26 resSeq  27    iCode
+    #   31-38 x        39-46 y        47-54 z
+    #   55-60 occ      61-66 bfac     77-78 element
+    # The atom name is 4 chars at columns 13-16. For 1-2 char element
+    # symbols (N, C, O, S, Cl, Br, ...) the *input* Vina name already
+    # contains the leading space (e.g. " Cl "), so we emit it
+    # verbatim. Resname is left-padded to 3 chars and lives at
+    # cols 18-20. Element is left-padded to 2 chars at cols 77-78
+    # so a 2-letter element like "Cl" lands in both positions.
+    #
+    # Earlier converters here either (a) double-padded the name and
+    # shifted every downstream field by 1 column — making
+    # load_pdb's element slice read the second character of "Cl"
+    # and end up as "L" — or (b) used a 78-char format that left
+    # the element column at the wrong offset. The version below
+    # produces exactly 80 chars and aligns every field to its
+    # canonical PDB position.
     pdb = (
-        f"{rec:<6s}"
-        f"{serial:>5s}"
-        f" {name:<4s}"
-        f"{resname:<3s} "
-        f"{chain:1s}{resseq:>4s}{icode:1s}   "
-        f"{x}{y}{z}"
-        f"{occ:>6s}{bfac:>6s}"
-        f"          "
-        f"{elem:>2s}"
+        f"{rec:<6s}"          # 1-6   record (ATOM / HETATM)
+        f"{serial:>5s}"       # 7-11  serial
+        f" "                  # 12    (altLoc for 4-char names is ' '
+                              #        at col 12; for 4-char aligned
+                              #        names it lives at col 13-16
+                              #        with the leading space already
+                              #        part of the name field)
+        f"{name:<4s}"         # 13-16 atom name
+        f" "                  # 17    altLoc
+        f"{resname:<3s}"      # 18-20 resname
+        f" "                  # 21
+        f"{chain:1s}"         # 22    chain
+        f"{resseq:>4s}"       # 23-26 resSeq
+        f"{icode:1s}"         # 27    iCode
+        f"   "                # 28-30 (3 spaces before coords)
+        f"{x}"                # 31-38 x
+        f"{y}"                # 39-46 y
+        f"{z}"                # 47-54 z
+        f"{occ:>6s}"          # 55-60 occupancy
+        f"{bfac:>6s}"         # 61-66 B-factor
+        f"      "            # 67-72 (6 spaces, pre-segId padding)
+        f"    "              # 73-76 segID (4 chars, blank here)
+        f"{elem:<2s}"        # 77-78 element (left-aligned)
+        f"  "               # 79-80 charge (2 chars, blank)
         f"\n"
     )
     return pdb

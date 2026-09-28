@@ -46,6 +46,12 @@ class Atom:
     bfactor: float = 0.0
     occupancy: float = 1.0
     is_hetero: bool = False
+    # Side-channel fields used by the H-bond SS detection in
+    # core/secondary.py. Set by ``assign_backbone_hbonds`` and read by
+    # ``compute_secondary_structure_from_hbonds``. Not part of the
+    # PDB data model — they're transient state.
+    hbond_other: Optional["Atom"] = None
+    hbond_distance_sq: float = float("inf")
 
     @property
     def chain_id(self) -> str:
