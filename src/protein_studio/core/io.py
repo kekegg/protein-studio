@@ -203,6 +203,16 @@ def load_pdb(path: str | os.PathLike, model_index: int = 0) -> Molecule:
         with p.open("r", encoding="utf-8", errors="replace") as fh:
             _annotate_secondary_structure(mol, fh)
 
+        # Third pass: HELIX/SHEET records aren't always present in
+        # PDB files (deposited snapshots, docked structures, homology
+        # models). After the explicit annotation pass, any residue still
+        # set to ``unknown`` gets φ/ψ-classified via Ramachandran
+        # regions. This means the ``secondary`` colour scheme paints
+        # a meaningful picture even for files that lack DSSP
+        # annotation.
+        from .secondary import infer_secondary_structure
+        infer_secondary_structure(mol)
+
     return mol
 
 
