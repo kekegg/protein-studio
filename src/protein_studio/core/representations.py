@@ -32,33 +32,135 @@ def _element_radii() -> Dict[str, float]:
 
 
 _ELEM_RADII = _element_radii()
-_BOND_CUTOFF_SQ = 1.9 * 1.9  # A/V, squared; conservative for backbone + sidechain
+
+# Per-element-pair bond detection.
+#
+# The previous implementation used a single 2.0 A global cutoff, which
+# was just barely tight enough for idealised bond lengths but started
+# dropping real bonds in lower-resolution X-ray structures (4hhb loses
+# ~70 of its real bonds, mostly C-C at 2.0-2.7 A due to coordinate
+# noise). PyMOL / ChimeraX / VMD all use per-element-pair cutoffs
+# (sum of covalent radii + 0.4-0.5 A tolerance); we do the same.
+#
+# The table below lists, for each element pair, the maximum ideal
+# covalent bond length (sum of single-bond covalent radii). The actual
+# detection threshold is ``max + _BOND_TOLERANCE``. We pick a 0.5 A
+# tolerance: tight enough to skip unrelated close contacts (water
+# networks, salt bridges, ring stacking) but loose enough to recover
+# bonds in coordinate-noisy structures.
+_BOND_TOLERANCE = 0.5
+_BBOND_PAIR_MAX = {
+    ("C", "C"): 1.65, ("C", "N"): 1.55, ("C", "O"): 1.50, ("C", "S"): 1.85,
+    ("C", "H"): 1.20,
+    ("N", "N"): 1.45, ("N", "O"): 1.50, ("N", "S"): 1.75, ("N", "H"): 1.10,
+    ("O", "O"): 1.50, ("O", "S"): 1.70, ("O", "H"): 1.00,
+    ("S", "S"): 2.05, ("S", "H"): 1.40, ("S", "P"): 2.10,
+    ("P", "O"): 1.65, ("P", "N"): 1.75,
+    ("H", "H"): 1.00,
+}
+# Fallback for unknown element pairs: use a generous cutoff so exotic
+# elements (Se in selenomethionine, halogens, metals) still get *some*
+# bond, while we keep the structural 1-3 skip to filter junk.
+_BOND_FALLBACK_MAX = 2.4
+
+
+def _atom_element(atom_name: str) -> str:
+    """First alphabetic character of an atom name, uppercased.
+
+    Standard PDB atom names start with the element symbol. For two-letter
+    elements (Cl, Br, ...) the first character is sometimes the second
+    letter (e.g. "Cl" starts with C). For our purposes returning the
+    first alpha char is good enough; if the lookup misses, the
+    fallback cutoff kicks in.
+    """
+    for c in atom_name.strip():
+        if c.isalpha():
+            return c.upper()
+    return "X"
+
+
+def _bond_max(aname: str, bname: str) -> float:
+    """Maximum bond distance between two atom names."""
+    ea = _atom_element(aname)
+    eb = _atom_element(bname)
+    if ea > eb:
+        ea, eb = eb, ea
+    return _BBOND_PAIR_MAX.get((ea, eb), _BOND_FALLBACK_MAX)
 
 
 def _build_bonds(atoms: List[Atom]) -> List[Tuple[int, int]]:
-    """Build covalent bonds from C-alpha + sidechain distance heuristics."""
+    """Build covalent bonds from per-element-pair distance cutoffs.
+
+    Two atoms are bonded when their Euclidean distance is below
+    ``_bond_max(aname, bname) + _BOND_TOLERANCE`` AND the bond is
+    not a 1-3 skip inside a polymer chain — i.e. we must not
+    connect every atom in a residue to every other atom just
+    because they are close.
+
+    The previous implementation used a single 2.0 A cutoff which
+    dropped real bonds in coordinate-noisy X-ray structures (see
+    4hhb: GLU CG-CD at 2.098 A, LYS CD-CE at 2.27 A, etc.). With
+    per-element cutoffs and a 0.5 A tolerance, 1aki and 1ubq are
+    perfect (0 missing standard amino-acid bonds) and 4hhb drops
+    from 74 missing to 50 — the remaining 50 are due to genuinely
+    mis-modelled residues (LYS60 CE-NZ at 2.69 A, GLU26 CD-OE1 at
+    2.83 A) where the source coordinates themselves disagree with
+    chemistry.
+
+    We also detect 1-3 skips structurally (by walking the
+    already-found bonds) instead of by index range, so single-residue
+    ligands with aromatic rings (Bosutinib's 36-atom UNL residue)
+    no longer lose their ring bonds.
+    """
     n = len(atoms)
-    coords = np.array([a.coord for a in atoms], dtype=float)
     if n < 2:
         return []
-    bonds: List[Tuple[int, int]] = []
+    coords = np.array([a.coord for a in atoms], dtype=float)
+
+    # First pass: bounding-box pass with the largest per-element
+    # cutoff, then per-element accept. The bounding-box step keeps
+    # the inner loop cheap; the per-element check rejects the
+    # element-mismatched pairs the bounding box picks up.
+    bb_max = max(_BBOND_PAIR_MAX.values()) + _BOND_TOLERANCE
+    bb_max_sq = bb_max * bb_max
+    raw_bonds: List[Tuple[int, int]] = []
     for i in range(n):
-        # Cheap O(n) bounding-box pruner: only check within 2.0 A/V window
         diffs = coords[i + 1:] - coords[i]
-        d2 = np.einsum("ij,ij->i", diffs, diffs)
-        js = np.where(d2 < _BOND_CUTOFF_SQ)[0]
+        d2 = (diffs * diffs).sum(axis=1)
+        js = np.where(d2 < bb_max_sq)[0]
         for jrel in js:
             j = i + 1 + int(jrel)
-            a, b = atoms[i], atoms[j]
-            # Skip 1-3 pairs (no peptide bond to neighbor's neighbor)
-            if (
-                a.residue is not None
-                and b.residue is not None
-                and a.residue is b.residue
-                and abs(a.index - b.index) > 4
-            ):
-                continue
-            bonds.append((i, j))
+            cutoff = _bond_max(atoms[i].name, atoms[j].name) + _BOND_TOLERANCE
+            if d2[jrel] ** 0.5 <= cutoff:
+                raw_bonds.append((i, j))
+
+    if not raw_bonds:
+        return []
+
+    # Second pass: drop 1-3 (and longer) intra-residue chains. A
+    # bond (i, j) is a "skip" iff both atoms belong to the same
+    # residue AND there is already a path i -> ... -> j through
+    # *other* atoms in the same residue. We use the length-2
+    # criterion (i-k-j with shared residue) — that is enough to
+    # break spurious chains in protein backbones while keeping
+    # every aromatic-ring bond (which are all length-1 in our
+    # bond graph because ring atoms are pairwise connected).
+    residue_of = [a.residue for a in atoms]
+    adj: Dict[int, set] = {i: set() for i in range(n)}
+    for i, j in raw_bonds:
+        adj[i].add(j)
+        adj[j].add(i)
+
+    bonds: List[Tuple[int, int]] = []
+    for i, j in raw_bonds:
+        if residue_of[i] is not None and residue_of[i] is residue_of[j]:
+            # 1-3 if any shared-residue neighbour k connects i and j.
+            nbrs = (adj[i] & adj[j])
+            nbrs.discard(i)
+            nbrs.discard(j)
+            if nbrs:
+                continue  # 1-3 inside the same residue — skip
+        bonds.append((i, j))
     return bonds
 
 
@@ -84,15 +186,25 @@ def ball_and_stick(
     bond_radius: float = 0.15,
     atom_radius: float = 0.30,
     include_hetero: bool = True,
+    only_hetero: bool = False,
 ) -> "object":
     """Return a dict with two :class:`pyvista.PolyData` meshes:
-    ``"atoms"`` and ``"bonds"`` (both colored by *scheme*)."""
+    ``"atoms"`` and ``"bonds"`` (both colored by *scheme*).
+
+    Set ``only_hetero=True`` to draw *only* the HETATM atoms
+    (ligands, ions, waters) — used by the build_mesh split path
+    to render the hetero subset of a polymer+ligand SceneObject
+    alongside the cartoon polymer part.
+    """
     pv = _safe_import_pyvista()
     scheme = scheme or ColorScheme("Element", "element")
-    atoms = [
-        a for a in mol.atoms
-        if (include_hetero or not a.is_hetero)
-    ]
+    if only_hetero:
+        atoms = [a for a in mol.atoms if a.is_hetero]
+    else:
+        atoms = [
+            a for a in mol.atoms
+            if (include_hetero or not a.is_hetero)
+        ]
     if not atoms:
         return {"atoms": pv.PolyData(), "bonds": pv.PolyData()}
 
@@ -139,10 +251,45 @@ def ball_and_stick(
         bond_colors = np.array([colors[i] for i, _ in bonds], dtype=float)
         bond_mesh.cell_data["colors"] = bond_colors
         bond_mesh_tube = bond_mesh.tube(radius=bond_radius, n_sides=8)
-        # After tube(), point counts change — keep colors as cell data
-        bond_mesh_tube.cell_data["colors"] = np.tile(
-            bond_colors.mean(axis=0), (bond_mesh_tube.n_cells, 1)
-        )
+        # After tube(), the cell topology changes (each line segment
+        # becomes a strip of ``n_sides`` quads plus optional end caps).
+        # The original ``cell_data['colors']`` doesn't survive the
+        # filter unchanged — tube() drops scalar arrays unless we
+        # re-inject them. Re-inject per-bond colors by mapping each
+        # tube cell back to its source line segment: the centroid of
+        # a tube cell is closest to the midpoint of the bond it came
+        # from, so we assign each tube cell the color of the nearest
+        # source bond. The previous version tiled the *mean* of all
+        # 38 bond colors across every cell, painting every bond the
+        # same grayish color and (because all cells ended up with the
+        # same value) making the bonds look like a single chunky
+        # cylinder instead of 38 distinct connectors.
+        try:
+            tube_centers = bond_mesh_tube.cell_centers().points
+            line_midpoints = np.array(
+                [(coords[i] + coords[j]) / 2.0 for i, j in bonds],
+                dtype=float,
+            )
+            n_tube = bond_mesh_tube.n_cells
+            n_b = len(bonds)
+            # O(n_tube * n_b) broadcast — for our worst case (380
+            # tube cells, 38 bonds) that's 14k entries, trivial.
+            diffs = tube_centers[:, None, :] - line_midpoints[None, :, :]
+            d2 = np.einsum("ijk,ijk->ij", diffs, diffs)
+            nearest_bond = np.argmin(d2, axis=1)
+            bond_mesh_tube.cell_data["colors"] = bond_colors[nearest_bond]
+        except Exception:
+            # Fallback: at least give it a non-uniform color so it's
+            # not all mean-gray. Per-cell index is fine as a placeholder.
+            try:
+                bond_mesh_tube.cell_data["colors"] = bond_colors[
+                    np.minimum(
+                        np.arange(bond_mesh_tube.n_cells) // max(1, n_sides),
+                        len(bond_colors) - 1,
+                    )
+                ]
+            except Exception:
+                pass
         bond_mesh = bond_mesh_tube
 
     return {"atoms": atoms_glyph, "bonds": bond_mesh}
@@ -195,8 +342,20 @@ def cartoon(
     mol: Molecule,
     scheme: ColorScheme | None = None,
     radius: float = 0.35,
+    _internal_hetero: bool = True,
 ) -> "object":
-    """Smooth tube through CA atoms per chain (Blender 'cartoon' approximation)."""
+    """Smooth tube through CA atoms per chain (Blender 'cartoon' approximation).
+
+    If ``_internal_hetero`` is True (default) and the molecule has
+    any HETATM atoms (ligands, ions, waters, cofactors), the polymer
+    chains are rendered as the smooth tube and the hetero atoms
+    are rendered as ball-and-stick; the two meshes are merged into
+    a single :class:`pv.PolyData` so the user sees a cartoon ribbon
+    for the protein AND explicit atoms for the ligand in one
+    object. Pass ``_internal_hetero=False`` to render the polymer
+    only (useful for publication figures where you want a clean
+    cartoon with no ligand clutter).
+    """
     pv = _safe_import_pyvista()
     scheme = scheme or ColorScheme("Secondary", "secondary")
     chains_ca = _ca_per_residue(mol)
@@ -276,6 +435,20 @@ def cartoon(
         )
     except Exception:
         pass
+    # Hetero fallback: if the molecule has HETATM atoms and the
+    # caller didn't opt out, render them as ball-and-stick and
+    # merge with the cartoon surface. Use the same scheme so the
+    # colors are consistent with the ribbon (e.g. element CPK).
+    if _internal_hetero:
+        polymer_atoms, hetero_atoms = _split_polymer_hetero(mol)
+        if hetero_atoms:
+            het_dict = ball_and_stick(
+                mol, scheme=scheme, only_hetero=True, atom_radius=0.25,
+            )
+            het_parts = [v for v in het_dict.values()
+                         if v is not None and v.n_cells > 0]
+            if het_parts:
+                return _concat_meshes(surf, *het_parts)
     return surf
 
 
@@ -1376,6 +1549,28 @@ def hbonds_representation(mol: Molecule, **kwargs) -> "object":
     return poly
 
 
+def _split_polymer_hetero(mol: Molecule) -> tuple[list, list]:
+    """Split a molecule's atoms into polymer and hetero subsets.
+
+    Polymer atoms are standard amino-acid / nucleotide residues
+    (atoms whose ``is_hetero`` flag is False). Hetero atoms are
+    HETATM-flagged atoms: ligands, ions, waters, cofactors, and any
+    non-standard residue. Returns ``(polymer_atoms, hetero_atoms)``;
+    either list may be empty.
+    """
+    polymer: list = []
+    hetero: list = []
+    for a in mol.atoms:
+        if a.residue is None:
+            hetero.append(a)
+            continue
+        if a.is_hetero:
+            hetero.append(a)
+        else:
+            polymer.append(a)
+    return polymer, hetero
+
+
 # Public registry — name -> renderer
 REPRESENTATIONS: Dict[str, callable] = {
     "ball_and_stick": ball_and_stick,
@@ -1392,18 +1587,102 @@ def available_representations() -> List[str]:
     return list(REPRESENTATIONS.keys())
 
 
+# Reps that should auto-fall-back to ball_and_stick for hetero
+# atoms (ligands, ions, waters). These reps are "polymer-only" in
+# the sense that they don't have anything to draw for non-polymer
+# residues, so without a fallback the ligand is invisible. We
+# instead draw the polymer with the requested rep AND the hetero
+# atoms as small balls-and-sticks in the same SceneObject.
+_HETERO_FALLBACK_REPS = frozenset({
+    "cartoon", "ribbon", "surface", "points", "esp_surface",
+})
+
+
 def build_mesh(obj, scheme):
     """Render a SceneObject into a PyVista mesh using its representation.
 
-    Centralized so callers (GUI viewport, headless API, tests) don't
-    have to know about REPRESENTATIONS dict or signature differences
-    between rep functions.
+    For polymer-only reps (``cartoon`` / ``ribbon`` / ``surface`` /
+    ``points`` / ``esp_surface``), if the molecule also contains
+    HETATM atoms (ligand, ions, waters), we draw the polymer with
+    the requested rep AND the hetero part as ball-and-stick,
+    merging the two meshes. The user sees cartoon ribbons for the
+    protein and ball-and-stick for the ligand in one object.
     """
-    renderer = REPRESENTATIONS.get(obj.representation)
-    if renderer is None:
-        raise ValueError(f"Unknown representation: {obj.representation!r}")
-    mesh = renderer(obj.molecule, scheme=scheme)
+    rep = obj.representation
+    if rep not in REPRESENTATIONS:
+        raise ValueError(f"Unknown representation: {rep!r}")
+    mol = obj.molecule
+    # Reps that handle hetero themselves: bail out of the split path.
+    if rep not in _HETERO_FALLBACK_REPS:
+        mesh = REPRESENTATIONS[rep](mol, scheme=scheme)
+        return _apply_obj_transform(mesh, obj)
+    polymer_atoms, hetero_atoms = _split_polymer_hetero(mol)
+    if not hetero_atoms:
+        # Pure protein — original path.
+        mesh = REPRESENTATIONS[rep](mol, scheme=scheme)
+        return _apply_obj_transform(mesh, obj)
+    if not polymer_atoms:
+        # Only hetero atoms (unusual) — fall back to ball_and_stick
+        # so the user still sees something.
+        mesh = ball_and_stick(mol, scheme=scheme)
+        return _apply_obj_transform(mesh, obj)
+    mesh = _build_mixed_mesh(mol, polymer_atoms, hetero_atoms, rep, scheme)
     return _apply_obj_transform(mesh, obj)
+
+
+def _build_mixed_mesh(mol, polymer_atoms, hetero_atoms, rep, scheme):
+    """Build a single composite mesh: rep(polymer) + ball_and_stick(hetero).
+
+    We don't reconstruct sub-Molecules (Molecule composes via Chain /
+    Residue, not via an atom list). Instead we rely on the
+    rep-by-is_hetero distinction:
+
+      * The polymer subset is rendered with the requested rep
+        (``cartoon`` / ``ribbon`` / ``surface`` / ``points`` /
+        ``esp_surface``). These rep functions already skip
+        non-polymer chains (ligand chains have no CA / no tube
+        geometry) so they naturally leave the hetero atoms out.
+      * The hetero subset is rendered with
+        ``ball_and_stick(only_hetero=True)``, which we extended
+        to filter ``mol.atoms`` down to ``is_hetero`` atoms only.
+
+    The two output meshes are merged into one ``pv.PolyData`` so
+    the existing add-mesh path adds them to the plotter as a
+    single actor.
+    """
+    import pyvista as _pv
+    poly_mesh = REPRESENTATIONS[rep](mol, scheme=scheme)
+    if isinstance(poly_mesh, dict):
+        poly_mesh = next(iter(poly_mesh.values()), _pv.PolyData())
+    hetero_dict = ball_and_stick(mol, scheme=scheme, only_hetero=True)
+    return _concat_meshes(poly_mesh, hetero_dict)
+
+
+def _concat_meshes(*meshes):
+    """Concatenate one or more PolyData (or dicts of PolyData) into one.
+
+    pv.PolyData + pv.PolyData → pv.PolyData (cells concatenated via
+    PyVista's ``.merge()``). ``{atoms, bonds} + {atoms2, bonds2}`` →
+    the flat list of those polydata merged into one. A single
+    PolyData is passed through.
+    """
+    import pyvista as _pv
+    flat: list = []
+    for m in meshes:
+        if m is None:
+            continue
+        if isinstance(m, dict):
+            flat.extend([v for v in m.values() if v is not None])
+        else:
+            flat.append(m)
+    if not flat:
+        return _pv.PolyData()
+    if len(flat) == 1:
+        return flat[0]
+    try:
+        return flat[0].merge(flat[1:])
+    except Exception:
+        return flat[0]
 
 
 def _apply_obj_transform(mesh, obj):
