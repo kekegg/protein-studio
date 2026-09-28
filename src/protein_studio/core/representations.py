@@ -49,14 +49,23 @@ _ELEM_RADII = _element_radii()
 # networks, salt bridges, ring stacking) but loose enough to recover
 # bonds in coordinate-noisy structures.
 _BOND_TOLERANCE = 0.5
+# Per-element-pair max bond distance. Keys are sorted alphabetically by
+# element symbol so that ``_bond_max`` can normalise the lookup
+# (smaller element first) and always find the entry — regardless of the
+# order the caller passes the two names in. The bug we just fixed:
+# ``("N", "H")`` here but the lookup normalised to ``("H", "N")`` so
+# N-H bonds were silently falling back to the 2.4 A fallback cutoff,
+# adding phantom bonds across the molecule (Bosutinib gained a fake
+# 2.45 A N-H bond).
 _BBOND_PAIR_MAX = {
-    ("C", "C"): 1.65, ("C", "N"): 1.55, ("C", "O"): 1.50, ("C", "S"): 1.85,
-    ("C", "H"): 1.20,
-    ("N", "N"): 1.45, ("N", "O"): 1.50, ("N", "S"): 1.75, ("N", "H"): 1.10,
-    ("O", "O"): 1.50, ("O", "S"): 1.70, ("O", "H"): 1.00,
-    ("S", "S"): 2.05, ("S", "H"): 1.40, ("S", "P"): 2.10,
-    ("P", "O"): 1.65, ("P", "N"): 1.75,
-    ("H", "H"): 1.00,
+    ("C", "C"): 1.65, ("C", "H"): 1.20, ("C", "N"): 1.55,
+    ("C", "O"): 1.50, ("C", "S"): 1.85, ("C", "P"): 1.85,
+    ("H", "H"): 1.00, ("H", "N"): 1.10, ("H", "O"): 1.00,
+    ("H", "S"): 1.40, ("H", "P"): 1.40,
+    ("N", "N"): 1.45, ("N", "O"): 1.50, ("N", "S"): 1.75, ("N", "P"): 1.75,
+    ("O", "O"): 1.50, ("O", "S"): 1.70, ("O", "P"): 1.65,
+    ("P", "P"): 2.10, ("P", "S"): 2.10,
+    ("S", "S"): 2.05,
 }
 # Fallback for unknown element pairs: use a generous cutoff so exotic
 # elements (Se in selenomethionine, halogens, metals) still get *some*

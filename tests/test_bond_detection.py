@@ -119,12 +119,60 @@ def test_bond_max_uses_table_for_known_pairs():
     assert abs(_bond_max("SG", "CB") - 1.85) < 1e-9   # C-S
 
 
+def test_bond_max_normalises_element_order_for_all_pairs():
+    """Regression test for the Bosutinib phantom-bond bug.
+
+    The previous table had ``("N", "H")`` but ``_bond_max`` normalises
+    to ``("H", "N")`` (smaller element first). The missing key made
+    N-H fall back to the 2.4 A fallback cutoff, adding a phantom
+    2.45 A N-H bond across the Bosutinib ligand.
+
+    The table now stores all pairs in normalised (smaller-first) order,
+    so the lookup works regardless of argument order.
+    """
+    # Pairs where the two elements are in alphabetical order
+    assert abs(_bond_max("CA", "HB") - 1.20) < 1e-9    # C-H
+    assert abs(_bond_max("N", "H") - 1.10) < 1e-9      # N-H (called as N, H)
+    assert abs(_bond_max("H", "N") - 1.10) < 1e-9      # ... and reversed
+    assert abs(_bond_max("O", "H") - 1.00) < 1e-9      # O-H
+    assert abs(_bond_max("S", "H") - 1.40) < 1e-9      # S-H
+    assert abs(_bond_max("P", "O") - 1.65) < 1e-9      # P-O
+    assert abs(_bond_max("P", "N") - 1.75) < 1e-9      # P-N
+    assert abs(_bond_max("P", "S") - 2.10) < 1e-9      # P-S
+
+
 def test_bond_max_uses_fallback_for_unknown():
     # Exotic elements not in {C, H, N, O, P, S} fall back to the
     # generous 2.4 A cutoff. (Selenium is *not* exotic — PDB atom
     # names "SE" start with "S" and are caught by the S-C entry.)
     assert abs(_bond_max("FE", "NE") - 2.4) < 1e-9   # iron-ligand
     assert abs(_bond_max("ZN", "SG") - 2.4) < 1e-9   # zinc-ligand
+
+
+def test_bosutinib_no_phantom_bonds():
+    """Regression test for the N-H phantom-bond bug.
+
+    Before the fix, ``_BBOND_PAIR_MAX`` had ``("N", "H")`` but
+    ``_bond_max`` normalised the lookup to ``("H", "N")``, missing
+    the entry and falling back to 2.4 A. This added a phantom
+    ``N(1)-H(7)`` bond at 2.445 A in Bosutinib (and would have
+    added similar false positives in any ligand where an N and an
+    H are spatially close but not actually bonded).
+    """
+    mol = load_pdb("examples/Bosutinib_docked_2_src.pdbqt")
+    atoms = list(mol.atoms)
+    bonds = _build_bonds(atoms)
+    # Compute distances for H-involved bonds — they should all be
+    # tight (real N-H ~1.01 A, never > 1.6 A).
+    import numpy as np
+    for i, j in bonds:
+        a, b = atoms[i], atoms[j]
+        if a.element == "H" or b.element == "H":
+            d = float(np.linalg.norm(np.array(a.coord) - np.array(b.coord)))
+            assert d < 1.6, (
+                f"phantom H bond: {a.name}({i}) - {b.name}({j}) at "
+                f"{d:.3f} A (cutoff is 1.10 + 0.5 = 1.60 A)"
+            )
 
 
 def test_bond_max_normalises_element_order():
