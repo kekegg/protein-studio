@@ -1515,7 +1515,12 @@ def esp_surface(
     else:
         # Honor the user's scheme (element / residue / chain / ...):
         # color each vertex by its nearest atom's scheme color.
-        rgb = np.array([scheme.color(atoms[i]) for i in ses.atom_id])
+        # ``ses.atom_id`` indexes into ``mol.atoms`` (the source atoms
+        # we passed via ``atom_idx_in_mol``), NOT into the local
+        # ``atoms`` list — when ``include_hetero=False`` the local
+        # list is shorter than ``mol.atoms`` and ``atoms[i]`` would
+        # raise IndexError. Look up by mol.atoms index.
+        rgb = np.array([scheme.color(atoms_all[i]) for i in ses.atom_id])
 
     mesh = pv.PolyData(verts, faces=_tri_flat(ses.faces))
     mesh.point_data["colors"] = rgb

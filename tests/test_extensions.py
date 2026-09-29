@@ -188,6 +188,38 @@ def test_esp_surface_mesh_has_colors():
     assert "potential" in (mesh.point_data.keys() or [])
 
 
+def test_esp_surface_non_default_scheme_with_hetatm():
+    """Regression: src_protein has 16 HETATM (water + ions) and is the
+    protein the GUI ships for demos. When a user enables esp_surface
+    with a non-default scheme (element / residue / chain / ...), the
+    per-vertex nearest-atom lookup has to index into mol.atoms (the
+    full list passed via atom_indices), NOT into the local filtered
+    'atoms' list — otherwise we got an IndexError when ses.atom_id
+    referred to a hetero atom we had skipped.
+    """
+    import pyvista as pv
+    mol = load_pdb(EXAMPLES / "src_protein.pdb")
+    # src_protein has HETATM records; include_hetero defaults to False
+    # so the local atoms list is shorter than mol.atoms.
+    assert any(a.is_hetero for a in mol.atoms), (
+        "src_protein should have HETATM atoms for this test"
+    )
+    scheme = SCHEME_PRESETS["element"]
+    mesh = esp_surface(mol, scale_factor=2.0, scheme=scheme)
+    assert isinstance(mesh, pv.PolyData)
+    # The bug surfaced as IndexError when ses.atom_id referenced an
+    # index past the end of the local filtered atoms list. If we get
+    # here without IndexError, the fix is in.
+    has_colors = "colors" in mesh.point_data.keys() or \
+                 "colors" in mesh.cell_data.keys()
+    assert has_colors, "esp_surface mesh should carry per-vertex colors"
+    colors = mesh.point_data.get("colors")
+    if colors is None:
+        colors = mesh.cell_data.get("colors")
+    assert colors is not None and len(colors) == mesh.n_points
+    assert np.isfinite(colors).all()
+
+
 # ============================================================== H-bonds
 
 
