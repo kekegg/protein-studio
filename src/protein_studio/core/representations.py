@@ -953,10 +953,10 @@ def _group_runs(frames: List[_ResFrame]) -> List[tuple[str, List[_ResFrame]]]:
 def ribbon(
     mol: Molecule,
     scheme: ColorScheme | None = None,
-    helix_width: float = 0.7,
+    helix_width: float = 1.4,
     sheet_width: float = 1.5,
     coil_width: float = 0.45,
-    helix_thickness: float = 0.7,
+    helix_thickness: float = 1.4,
     sheet_thickness: float = 0.3,
     coil_thickness: float = 0.45,
     quality: int = 22,
