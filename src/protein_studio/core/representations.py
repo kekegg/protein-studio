@@ -962,7 +962,6 @@ def ribbon(
     quality: int = 22,
     chain_subdiv: int = 6,
     smooth_window: int = 3,
-    side_smooth: int = 5,
 ) -> "object":
     """SS-aware PyMOL/3Dmol.js-style ribbon: per-SS cross-section shape with
     smooth transitions.
@@ -1096,54 +1095,6 @@ def ribbon(
 
         # Binormal = side × tangent (perpendicular to both, gives the
         # direction along which we extrude for thickness).
-        binormals = np.cross(sides, tangents)
-        for i in range(n):
-            nrm = np.linalg.norm(binormals[i])
-            binormals[i] = binormals[i] / nrm if nrm > 1e-9 \
-                else np.array([0.0, 0.0, 1.0])
-
-        # Smooth the per-residue side vector with a Gaussian kernel,
-        # in the tangent's perpendicular plane. Raw CA→O directions
-        # are noisy — the carbonyl tilt varies by a few degrees per
-        # residue from thermal motion and refinement noise — and that
-        # jitter reads as a wavy ribbon instead of a smooth helix
-        # barrel. Re-project each smoothed side back onto the
-        # perpendicular-to-tangent plane (so it doesn't pick up an
-        # axial component) and renormalize. The kernel half-width is
-        # ``side_smooth`` residues; the smoothing pass is skipped if
-        # side_smooth <= 1 or the chain is too short to benefit.
-        if side_smooth > 1 and n >= 3:
-            half = max(1, side_smooth // 2)
-            xs = np.arange(-half, half + 1)
-            kernel = np.exp(-0.5 * (xs / max(0.5, half * 0.5)) ** 2)
-            kernel = kernel / kernel.sum()
-            smoothed_sides = np.zeros_like(sides)
-            for i in range(n):
-                # Gaussian-weighted average of nearby sides, then
-                # re-orthogonalize against the local tangent and
-                # normalize.
-                lo = max(0, i - half)
-                hi = min(n, i + half + 1)
-                # Slice kernel to the same range, renormalize so the
-                # boundary doesn't drop the weight.
-                k = kernel[(lo - (i - half)):(hi - (i - half))]
-                k = k / k.sum()
-                avg = np.zeros(3)
-                for j in range(lo, hi):
-                    avg += k[j - lo] * sides[j]
-                # Strip any axial component, normalize.
-                ax = tangents[i]
-                perp = avg - ax * ax.dot(avg)
-                nrm = np.linalg.norm(perp)
-                if nrm > 1e-6:
-                    smoothed_sides[i] = perp / nrm
-                else:
-                    smoothed_sides[i] = sides[i]
-            sides = smoothed_sides
-
-        # Re-derive binormals from the smoothed sides so the cross
-        # section's thickness direction stays consistent with the
-        # smoothed width direction.
         binormals = np.cross(sides, tangents)
         for i in range(n):
             nrm = np.linalg.norm(binormals[i])
