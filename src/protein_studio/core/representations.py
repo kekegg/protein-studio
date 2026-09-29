@@ -956,7 +956,7 @@ def ribbon(
     helix_width: float = 1.4,
     sheet_width: float = 1.5,
     coil_width: float = 0.45,
-    helix_thickness: float = 1.4,
+    helix_thickness: float = 0.7,
     sheet_thickness: float = 0.3,
     coil_thickness: float = 0.45,
     quality: int = 22,
