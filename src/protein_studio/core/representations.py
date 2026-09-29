@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 import numpy as np
+import math
 
 from .colors import ColorScheme
 from .molecule import Atom, Molecule, Residue
@@ -1178,13 +1179,21 @@ def ribbon(
             eff_thicks[k] = max(eff_thicks[k], sheet_thickness)
 
         # Cross-section: per-sample ellipse in the (side, binormal) plane.
-        # `widths[k]` is the half-axis along the side direction,
-        # `thickns[k]` along the binormal. With helix (w ≈ t) the
-        # cross-section is a circle → reads as a true cylinder under
-        # Phong shading. With sheet (w >> t) it's a flat oval → reads
-        # as a flat arrow. With loop (w ≈ t small) it's a thin tube.
-        # Because widths/thickns are smoothed across SS boundaries, the
-        # cross-section smoothly tapers from one shape to the next.
+        # For helix and loop we use a true *circle* — the side/binormal
+        # extents are equal — so the cross-section reads as a tube/barrel
+        # along the helix axis (matches PyMOL / 3Dmol.js: alpha-helices
+        # look like cylinders, not flat ribbons). For sheets the
+        # extents stay asymmetric (w >> t) so we get the flat arrow
+        # plate that identifies strand direction.
+        #
+        # To keep the helix radius compatible with the previous
+        # behaviour, we set
+        #   radius_circle = max(w, t) / sqrt(2)
+        # which gives a circle with the same RMS half-extent as the old
+        # 2:1 ellipse (w on side, t/2 on binormal) had — so overall
+        # tube thickness on screen stays close to before, just rounded.
+        # Sheet/arrow still get the full asymmetric (w, t) ellipse so
+        # they still read as arrows.
         full = np.zeros((num_cross, n, 3))
         theta = np.linspace(0.0, 2.0 * np.pi, num_cross, endpoint=False)
         cos_t = np.cos(theta)
@@ -1194,11 +1203,24 @@ def ribbon(
             t = eff_thicks[k]
             side_dir = sides[k]
             bin = binormals[k]
-            # point in the (side, binormal) plane of the cross-section
+            ss = ss_list[per_sample_orig[k]]
+            if ss == "sheet":
+                # Flat arrow: keep the asymmetric ellipse — the
+                # sheet reads as a flat plate with the arrow widening
+                # at the C-end, like PyMOL/3Dmol.js.
+                side_extent = w
+                bin_extent  = t
+            else:
+                # Helix / loop → true cylinder. Use the geometric mean
+                # of w and t as the radius so the tube stays the same
+                # thickness as the old 2:1 ellipse on average.
+                radius = math.sqrt(w * t)
+                side_extent = radius
+                bin_extent  = radius
             full[:, k, :] = (
                 positions[k][None, :]
-                + (cos_t * w)[:, None] * side_dir[None, :]
-                + (sin_t * t * 0.5)[:, None] * bin[None, :]
+                + (cos_t * side_extent)[:, None] * side_dir[None, :]
+                + (sin_t * bin_extent)[:, None] * bin[None, :]
             )
 
         # Per-vertex color (one color per residue, interpolated)
