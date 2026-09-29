@@ -1147,47 +1147,92 @@ def ribbon(
                 if k > 0 and ss_list[k - 1] == "sheet":
                     arrow_residue_idx.add(k - 1)
 
-        # Subdivide along the chain to smooth the ribbon. We insert
-        # (chain_subdiv - 1) extra samples between every pair of
-        # adjacent residues, interpolating position, tangent, side,
-        # binormal, and width via spherical-linear / linear blends.
-        if chain_subdiv > 1 and n >= 2:
-            new_pos = [positions[0]]
-            new_tan = [tangents[0]]
-            new_side = [sides[0]]
-            new_bin = [binormals[0]]
-            new_w = [widths[0]]
-            new_th = [thickns[0]]
-            new_ss_idx = [0]  # which residue each sample's color comes from
-            for i in range(n - 1):
-                p1, p2 = positions[i], positions[i + 1]
-                t1, t2 = tangents[i], tangents[i + 1]
-                s1, s2 = sides[i], sides[i + 1]
-                b1, b2 = binormals[i], binormals[i + 1]
-                w1, w2 = widths[i], widths[i + 1]
-                th1, th2 = thickns[i], thickns[i + 1]
+        # Subdivide along the chain with a Catmull-Rom spline (centripetal
+        # flavor) so the ribbon between consecutive residues is a
+        # smooth arc instead of a straight chord. The previous
+        # version used linear interpolation of `positions[i+1] -
+        # positions[i]`, which produced visible corners at every
+        # residue boundary (harsh 90-degree-ish kinks where two
+        # straight chords met at a CA). Catmull-Rom pulls the curve
+        # through p1 and p2 with tangents derived from (p0, p1, p2,
+        # p3), giving C1 continuity: the ribbon enters and leaves
+        # each residue smoothly, no more kinks. Tangent / side /
+        # binormal / width are slerp-interpolated as before — those
+        # were never linear.
+        if chain_subdiv > 1 and n >= 4:
+            new_pos: list[np.ndarray] = []
+            new_tan: list[np.ndarray] = []
+            new_side: list[np.ndarray] = []
+            new_bin: list[np.ndarray] = []
+            new_w: list[float] = []
+            new_th: list[float] = []
+            new_ss_idx: list[int] = []
+            for i in range(1, n - 1):
+                p0 = positions[i - 1]
+                p1 = positions[i]
+                p2 = positions[i + 1]
+                p3 = positions[i + 2] if i + 2 < n else p2
+                t1 = tangents[i]
+                t2 = tangents[i + 1]
+                s1 = sides[i]
+                s2 = sides[i + 1]
+                w1 = widths[i]
+                w2 = widths[i + 1]
+                th1 = thickns[i]
+                th2 = thickns[i + 1]
+                # First sample at the residue i (the curve passes
+                # through p1 exactly).
+                new_pos.append(p1)
+                new_tan.append(t1)
+                new_side.append(s1)
+                bnew = np.cross(s1, t1)
+                bnrm = np.linalg.norm(bnew)
+                new_bin.append(bnew / bnrm if bnrm > 1e-9
+                               else np.array([0.0, 0.0, 1.0]))
+                new_w.append(w1)
+                new_th.append(th1)
+                new_ss_idx.append(i)
+                # chain_subdiv-1 interior samples on the arc from
+                # p1 to p2. Catmull-Rom (uniform, alpha=0.5):
+                #   P(u) = 0.5 * [(2p1)
+                #                 + (-p0 + p2) u
+                #                 + (2p0 - 5p1 + 4p2 - p3) u^2
+                #                 + (-p0 + 3p1 - 3p2 + p3) u^3]
+                # which guarantees C1 continuity across p1 and p2.
                 for k in range(1, chain_subdiv):
                     u = k / chain_subdiv
-                    new_pos.append((1 - u) * p1 + u * p2)
+                    u2 = u * u
+                    u3 = u2 * u
+                    pos = 0.5 * (
+                        2.0 * p1
+                        + (-p0 + p2) * u
+                        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u2
+                        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u3
+                    )
+                    new_pos.append(pos)
                     new_tan.append(_slerp_unit(t1, t2, u))
                     new_side.append(_slerp_unit(s1, s2, u))
-                    # binormal recomputed from the new side × tangent
                     bnew = np.cross(new_side[-1], new_tan[-1])
                     bnrm = np.linalg.norm(bnew)
                     new_bin.append(bnew / bnrm if bnrm > 1e-9
-                                    else np.array([0.0, 0.0, 1.0]))
-                    new_w.append((1 - u) * w1 + u * w2)
-                    new_th.append((1 - u) * th1 + u * th2)
-                    # Color comes from the closer residue for visual
-                    # fidelity when crossing an SS boundary.
+                                   else np.array([0.0, 0.0, 1.0]))
+                    new_w.append((1.0 - u) * w1 + u * w2)
+                    new_th.append((1.0 - u) * th1 + u * th2)
+                    # Color comes from the closer residue.
                     new_ss_idx.append(i if u < 0.5 else i + 1)
-                new_pos.append(p2)
-                new_tan.append(t2)
-                new_side.append(s2)
-                new_bin.append(b2)
-                new_w.append(w2)
-                new_th.append(th2)
-                new_ss_idx.append(i + 1)
+            # Append the last residue verbatim so we don't lose the
+            # C-terminus (Catmull-Rom needs p_{n-2}, p_{n-1}, and a
+            # phantom p_n; we use p_{n-1} twice as the endpoints).
+            new_pos.append(positions[-1])
+            new_tan.append(tangents[-1])
+            new_side.append(sides[-1])
+            bnew = np.cross(sides[-1], tangents[-1])
+            bnrm = np.linalg.norm(bnew)
+            new_bin.append(bnew / bnrm if bnrm > 1e-9
+                           else np.array([0.0, 0.0, 1.0]))
+            new_w.append(widths[-1])
+            new_th.append(thickns[-1])
+            new_ss_idx.append(n - 1)
             positions = np.array(new_pos)
             tangents = np.array(new_tan)
             sides = np.array(new_side)
