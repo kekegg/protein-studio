@@ -1023,27 +1023,75 @@ def ribbon(
             nrm = np.linalg.norm(t)
             tangents[i] = t / nrm if nrm > 1e-9 else np.array([0.0, 0.0, 1.0])
 
-        # Side vector (perpendicular to tangent, parallel-transported to
-        # avoid twist between residues)
+        # Side vector — the ribbon's *width* axis. The crucial point:
+        # for alpha helices we DON'T parallel-transport. Instead we let
+        # the side direction follow the CA→O bond, which lives in the
+        # peptide plane perpendicular to the backbone. As you walk
+        # along an alpha helix, the carbonyl O rotates ~100° per residue
+        # around the helix axis, so the side vector naturally rotates
+        # around the backbone too — the flat ribbon strip therefore
+        # twists around the helix as you traverse it, and after ~3.6
+        # residues (one full turn) the ribbon has swept a full 360°,
+        # producing the cylindrical barrel look (PyMOL / 3Dmol.js).
+        # Parallel transport would lock the side direction and you'd
+        # see a flat ribbon that never closes into a cylinder.
+        #
+        # We try CA→O first; if the residue has no O (loop terminus,
+        # hetero, etc.) we fall back to parallel transport of the
+        # previous side direction so the strip doesn't twist
+        # arbitrarily.
         world_up = np.array([0.0, 1.0, 0.0])
         sides = np.zeros_like(positions)
         prev_side = None
+        # Build a quick lookup {residue -> O atom} for the CA atoms we
+        # have. Missing O → fall back to parallel transport.
+        o_dir_per_residue: list = []
+        for a in backbone:
+            o_atom = a.residue.atom("O") if a.residue else None
+            if o_atom is not None:
+                o_dir_per_residue.append(o_atom.coord - a.coord)
+            else:
+                o_dir_per_residue.append(None)
         for i in range(n):
             axis = tangents[i]
-            if prev_side is None:
-                cand = world_up if abs(axis.dot(world_up)) < 0.9 \
-                    else np.array([1.0, 0.0, 0.0])
-                side = cand - axis * axis.dot(cand)
-            else:
-                side = prev_side - axis * axis.dot(prev_side)
-            nrm = np.linalg.norm(side)
-            if nrm < 1e-6:
-                cand = world_up if abs(axis.dot(world_up)) < 0.9 \
-                    else np.array([1.0, 0.0, 0.0])
-                side = cand - axis * axis.dot(cand)
+            # Try CA→O first
+            side: np.ndarray | None = None
+            o_off = o_dir_per_residue[i]
+            if o_off is not None:
+                cand = np.asarray(o_off, dtype=float)
+                # Project out the component along the backbone so the
+                # side vector stays perpendicular to the tangent. The
+                # CA→O bond is already roughly perpendicular but a few
+                # residues near helix termini can tilt slightly.
+                perp = cand - axis * axis.dot(cand)
+                nrm = np.linalg.norm(perp)
+                if nrm > 1e-6:
+                    side = perp / nrm
+            if side is None:
+                # Fall back: parallel transport from the previous
+                # side, or pick a world-up vector if we're at the
+                # first residue.
+                if prev_side is not None:
+                    side = prev_side - axis * axis.dot(prev_side)
+                else:
+                    cand = world_up if abs(axis.dot(world_up)) < 0.9 \
+                        else np.array([1.0, 0.0, 0.0])
+                    side = cand - axis * axis.dot(cand)
                 nrm = np.linalg.norm(side)
-            sides[i] = side / nrm
-            prev_side = sides[i]
+                if nrm < 1e-6:
+                    cand = world_up if abs(axis.dot(world_up)) < 0.9 \
+                        else np.array([1.0, 0.0, 0.0])
+                    side = cand - axis * axis.dot(cand)
+                    nrm = np.linalg.norm(side)
+                side = side / nrm
+            # Anti-flip: if the new side flipped > 90° from the
+            # previous side, negate it. This avoids a 180° twist on
+            # residues with no O where the parallel-transport fallback
+            # would otherwise pick the wrong hemisphere.
+            if prev_side is not None and np.dot(side, prev_side) < 0:
+                side = -side
+            sides[i] = side
+            prev_side = side
 
         # Binormal = side × tangent (perpendicular to both, gives the
         # direction along which we extrude for thickness).
@@ -1179,21 +1227,18 @@ def ribbon(
             eff_thicks[k] = max(eff_thicks[k], sheet_thickness)
 
         # Cross-section: per-sample ellipse in the (side, binormal) plane.
-        # For helix and loop we use a true *circle* — the side/binormal
-        # extents are equal — so the cross-section reads as a tube/barrel
-        # along the helix axis (matches PyMOL / 3Dmol.js: alpha-helices
-        # look like cylinders, not flat ribbons). For sheets the
-        # extents stay asymmetric (w >> t) so we get the flat arrow
-        # plate that identifies strand direction.
-        #
-        # To keep the helix radius compatible with the previous
-        # behaviour, we set
-        #   radius_circle = max(w, t) / sqrt(2)
-        # which gives a circle with the same RMS half-extent as the old
-        # 2:1 ellipse (w on side, t/2 on binormal) had — so overall
-        # tube thickness on screen stays close to before, just rounded.
-        # Sheet/arrow still get the full asymmetric (w, t) ellipse so
-        # they still read as arrows.
+        # Every SS type uses a *flat* ellipse — wider along the side
+        # direction (where the ribbon's "face" lives), thinner along
+        # the binormal. The flat ellipse is the strip you see at each
+        # residue; it's the rotation of this strip around the backbone
+        # (driven by the CA→O side vector flipping with the helix)
+        # that closes the ribbon into a cylindrical barrel after one
+        # full turn. Sheets get a wider-but-still-flat arrow plate;
+        # helices and loops get the ribbon width but stay flat.
+        # The old `t * 0.5` factor is the binormal half-axis — it
+        # gives the strip a thin "edge" view so it reads as a
+        # rectangle from the side, and a wider "face" view along
+        # the ribbon's width — matches the look of a PyMOL ribbon.
         full = np.zeros((num_cross, n, 3))
         theta = np.linspace(0.0, 2.0 * np.pi, num_cross, endpoint=False)
         cos_t = np.cos(theta)
@@ -1203,24 +1248,10 @@ def ribbon(
             t = eff_thicks[k]
             side_dir = sides[k]
             bin = binormals[k]
-            ss = ss_list[per_sample_orig[k]]
-            if ss == "sheet":
-                # Flat arrow: keep the asymmetric ellipse — the
-                # sheet reads as a flat plate with the arrow widening
-                # at the C-end, like PyMOL/3Dmol.js.
-                side_extent = w
-                bin_extent  = t
-            else:
-                # Helix / loop → true cylinder. Use the geometric mean
-                # of w and t as the radius so the tube stays the same
-                # thickness as the old 2:1 ellipse on average.
-                radius = math.sqrt(w * t)
-                side_extent = radius
-                bin_extent  = radius
             full[:, k, :] = (
                 positions[k][None, :]
-                + (cos_t * side_extent)[:, None] * side_dir[None, :]
-                + (sin_t * bin_extent)[:, None] * bin[None, :]
+                + (cos_t * w)[:, None] * side_dir[None, :]
+                + (sin_t * t * 0.5)[:, None] * bin[None, :]
             )
 
         # Per-vertex color (one color per residue, interpolated)
