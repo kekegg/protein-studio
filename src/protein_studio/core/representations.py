@@ -959,8 +959,8 @@ def ribbon(
     helix_thickness: float = 0.7,
     sheet_thickness: float = 0.3,
     coil_thickness: float = 0.45,
-    quality: int = 22,
-    chain_subdiv: int = 6,
+    quality: int = 44,
+    chain_subdiv: int = 12,
     smooth_window: int = 3,
 ) -> "object":
     """SS-aware PyMOL/3Dmol.js-style ribbon: per-SS cross-section shape with
