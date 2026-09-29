@@ -1675,12 +1675,21 @@ def _build_mixed_mesh(mol, polymer_atoms, hetero_atoms, rep, scheme):
 def _concat_meshes(*meshes):
     """Concatenate one or more PolyData (or dicts of PolyData) into one.
 
-    pv.PolyData + pv.PolyData → pv.PolyData (cells concatenated via
-    PyVista's ``.merge()``). ``{atoms, bonds} + {atoms2, bonds2}`` →
-    the flat list of those polydata merged into one. A single
-    PolyData is passed through.
+    PyVista's ``PolyData.merge()`` drops any ``point_data`` / ``cell_data``
+    array that isn't present in *every* input mesh. That's fine for a
+    pure-protein molecule (all reps share the same scalar fields) but
+    silent-data-loss for the mixed-actor path: ``esp_surface`` writes
+    ``colors`` / ``potential`` / ``atom_id`` on its surface mesh while
+    ``ball_and_stick`` writes ``radii`` / ``GlyphVector`` / ``TubeNormals``
+    on the hetero mesh — neither has the other's arrays, so PyVista
+    drops them all and the result is a colorless surface.
+
+    The fix: build the union manually. Stack points and cell offsets,
+    then concatenate arrays per array-name, padding missing entries
+    with zeros of the appropriate shape.
     """
     import pyvista as _pv
+    import numpy as _np
     flat: list = []
     for m in meshes:
         if m is None:
@@ -1694,9 +1703,81 @@ def _concat_meshes(*meshes):
     if len(flat) == 1:
         return flat[0]
     try:
-        return flat[0].merge(flat[1:])
+        # 1) Points
+        all_points = _np.vstack([m.points for m in flat])
+        # 2) Cells — PyVista's ``faces`` array only contains triangle
+        #    connectivity and is empty for line / vertex / strip meshes
+        #    (e.g. the bond tube mesh from ball_and_stick uses
+        #    VTK_LINE cells — its ``faces`` is empty even though it has
+        #    160 n_cells). Walk VTK's cell array directly to handle
+        #    any cell type.
+        cell_blocks: list = []
+        point_offset = 0
+        for m in flat:
+            block: list = []
+            for cid in range(m.n_cells):
+                cell = m.get_cell(cid)
+                npts = cell.n_points
+                block.append(npts)
+                # point_ids is a tuple — convert to ndarray before the
+                # offset so list+int doesn't trip us up.
+                block.extend(
+                    (_np.asarray(cell.point_ids, dtype=_np.int64)
+                     + point_offset).tolist()
+                )
+            cell_blocks.append(_np.asarray(block, dtype=_np.int64))
+            point_offset += m.n_points
+        all_faces = (_np.concatenate(cell_blocks)
+                     if cell_blocks else _np.array([], dtype=_np.int64))
+        out = _pv.PolyData(all_points, all_faces)
+
+        # 3) Point data — concatenate per array-name, pad missing
+        #    inputs with zeros of the right shape.
+        all_point_keys: set = set()
+        for m in flat:
+            all_point_keys.update(m.point_data.keys())
+        for key in all_point_keys:
+            arrays = []
+            for m in flat:
+                if key in m.point_data.keys():
+                    arrays.append(m.point_data[key])
+                else:
+                    ref = next((mm.point_data[key]
+                                for mm in flat if key in mm.point_data.keys()),
+                               None)
+                    if ref is None:
+                        continue
+                    shape = (m.n_points,) + ref.shape[1:]
+                    arrays.append(_np.zeros(shape, dtype=ref.dtype))
+            out.point_data[key] = _np.concatenate(arrays, axis=0)
+
+        # 4) Cell data — same idea
+        all_cell_keys: set = set()
+        for m in flat:
+            all_cell_keys.update(m.cell_data.keys())
+        for key in all_cell_keys:
+            arrays = []
+            for m in flat:
+                if key in m.cell_data.keys():
+                    arrays.append(m.cell_data[key])
+                else:
+                    ref = next((mm.cell_data[key]
+                                for mm in flat if key in mm.cell_data.keys()),
+                               None)
+                    if ref is None:
+                        continue
+                    shape = (m.n_cells,) + ref.shape[1:]
+                    arrays.append(_np.zeros(shape, dtype=ref.dtype))
+            out.cell_data[key] = _np.concatenate(arrays, axis=0)
+
+        return out
     except Exception:
-        return flat[0]
+        # Fall back to PyVista's merge (silently loses disjoint arrays
+        # but at least the geometry survives).
+        try:
+            return flat[0].merge(flat[1:])
+        except Exception:
+            return flat[0]
 
 
 def _apply_obj_transform(mesh, obj):

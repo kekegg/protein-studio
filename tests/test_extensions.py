@@ -26,6 +26,7 @@ from protein_studio.core.io import load_pdb
 from protein_studio.core.molecule import Molecule
 from protein_studio.core.representations import (
     esp_surface, hbonds_representation, available_representations,
+    build_mesh,
 )
 
 
@@ -217,6 +218,49 @@ def test_esp_surface_non_default_scheme_with_hetatm():
     if colors is None:
         colors = mesh.cell_data.get("colors")
     assert colors is not None and len(colors) == mesh.n_points
+    assert np.isfinite(colors).all()
+
+
+def test_mixed_mesh_preserves_esp_surface_colors_with_ligand():
+    """Regression: the mixed-mesh path (esp_surface polymer +
+    ball_and_stick hetero) used to drop ALL point_data / cell_data
+    arrays because PyVista's ``PolyData.merge()`` only keeps arrays
+    present in every input mesh — and the surface mesh (colors /
+    potential / atom_id) and the ball_and_stick mesh (radii /
+    GlyphVector / TubeNormals) share nothing. Result: a colorless
+    surface ("NO COLORS! rendered as gray fallback") even though
+    esp_surface computed the right colors.
+
+    The fix is in ``_concat_meshes``: build the union manually,
+    walking VTK cells directly (PyVista's ``.faces`` is empty for
+    line cells — the bond tube mesh uses VTK_LINE cells), then
+    concatenate per array-name with zero-fill on inputs that don't
+    have it. Verify the merged output carries ``colors``.
+    """
+    import pyvista as pv
+    from protein_studio.api import StudioAPI, HeadlessViewport
+    api = StudioAPI(viewport=HeadlessViewport())
+    # Ligand first so the protein's mixed-mesh branch (which adds a
+    # ball_and_stick overlay for the hetero atoms) actually fires.
+    api.load("examples/Bosutinib_docked_2_src.pdbqt",
+             representation="ball_and_stick", scheme="element")
+    api.load("examples/src_protein.pdb",
+             representation="esp_surface", scheme="element")
+    obj = next(o for o in api.scene.objects if o.name == "src_protein")
+    mesh = build_mesh(obj, obj.color_scheme)
+    if isinstance(mesh, dict):
+        mesh = next(iter(mesh.values()))
+    assert isinstance(mesh, pv.PolyData)
+    assert mesh.n_points > 1000
+    # The esp_surface output carries these; the ball_and_stick output
+    # carries a different set. After _concat_meshes, both must survive.
+    assert "colors" in mesh.point_data.keys(), (
+        f"_concat_meshes dropped 'colors' from esp_surface; "
+        f"point_data={list(mesh.point_data.keys())}, "
+        f"cell_data={list(mesh.cell_data.keys())}"
+    )
+    colors = mesh.point_data["colors"]
+    assert colors.shape == (mesh.n_points, 3)
     assert np.isfinite(colors).all()
 
 
