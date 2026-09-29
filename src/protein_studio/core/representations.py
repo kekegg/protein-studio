@@ -1373,8 +1373,12 @@ def surface(
         mesh.point_data["potential"] = pot
     else:
         # Per-vertex colour from the scheme — use atom_id to look up
-        # the scheme colour of the nearest atom.
-        colors = np.array([scheme.color(atoms[i]) for i in result.atom_id])
+        # the scheme colour of the nearest atom. ``result.atom_id``
+        # indexes into ``mol.atoms`` (we passed it via
+        # ``atom_idx_in_mol``), NOT the local filtered ``atoms`` list
+        # — when ``include_hetero=False`` and the molecule has HETATM,
+        # ``atoms[i]`` raises IndexError. Look up by mol.atoms index.
+        colors = np.array([scheme.color(atoms_all[i]) for i in result.atom_id])
 
     mesh.point_data["colors"] = colors
     mesh.point_data["atom_id"] = result.atom_id

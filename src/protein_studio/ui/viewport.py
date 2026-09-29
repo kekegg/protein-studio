@@ -254,22 +254,32 @@ class ViewportWidget(QWidget):
         if hasattr(self.plotter, "actors"):
             for actor_name in list(self.plotter.actors.keys()):
                 # We only own actors whose names are scene object names
-                # or our `name:atoms` / `name:bonds` sub-names. When the
-                # scene is empty, remove ALL of them; otherwise only
-                # remove actors whose base is no longer in the scene
-                # OR whose corresponding scene object has just been
-                # hidden via the outliner checkbox.
+                # or our `name:atoms` / `name:bonds` sub-names.
+                #
+                # Remove every owned actor — including ones whose
+                # representation is *unchanged* — to guarantee no overlap
+                # when the user switches reps (cartoon → ribbon, surface
+                # → esp_surface, …). PyVista's ``add_mesh(name=...)``
+                # replaces the named actor in the plotter dict but the
+                # underlying vtkMapper occasionally keeps the OLD input
+                # data alive (we observed n_points=0 on the mapper after
+                # a same-name add_mesh), and even when it doesn't, the
+                # ``_ORIENTATION_WIDGETS`` / mapper cache left from the
+                # previous build path can leak colors back into the new
+                # actor. Cheapest fix: nuke our owned actors and let the
+                # re-add loop below rebuild them fresh. The mesh cost is
+                # the same (we re-build every visible object's mesh on
+                # every refresh anyway).
                 base = actor_name.split(":", 1)[0]
-                base_obj = owned_objs.get(base)
                 should_remove = (
                     not owned_objs
-                    or base not in owned_objs
-                    or (base_obj is not None and not base_obj.visible)
+                    or base in owned_objs
                 )
                 if should_remove:
                     try:
                         self.plotter.remove_actor(actor_name)
                     except Exception:
+                        pass
                         pass
         # Re-install lights / SSAO only if they were lost (cheap to do
         # every time; RemoveAllLights() is idempotent on a clean state).
