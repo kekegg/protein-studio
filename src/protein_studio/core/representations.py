@@ -1251,8 +1251,12 @@ def ribbon(
             i_orig = min(new_ss_idx[k] if chain_subdiv > 1 else k, len(ss_list) - 1)
             per_sample_orig.append(i_orig)
 
-        # Mark the C-end of each sheet strand: any sample whose next
-        # sample is not a sheet. Apply 2× width to last 2 samples.
+        # Mark the C-end of each sheet strand: only the very last
+        # subdivided sample of the strand's final residue goes into
+        # ``arrow_samples``. Keeps the widened region to a single
+        # sample per strand — earlier versions added all
+        # ``chain_subdiv`` samples of the final residue, which made
+        # the widened "arrow flare" too long.
         arrow_samples: set[int] = set()
         for k in range(n):
             i_orig = per_sample_orig[k]
@@ -1260,16 +1264,41 @@ def ribbon(
                 continue
             nxt_orig = ss_list[i_orig + 1] if i_orig + 1 < len(ss_list) else "loop"
             if nxt_orig != "sheet":
-                arrow_samples.add(k)
-                if k > 0 and per_sample_orig[k - 1] == i_orig:
-                    arrow_samples.add(k - 1)
+                # Only add k when the *next* sample belongs to a
+                # different residue — i.e., k is the last subdivided
+                # sample of the C-end residue (or the very last sample
+                # in the chain).
+                if k + 1 >= n or per_sample_orig[k + 1] != i_orig:
+                    arrow_samples.add(k)
         eff_widths = widths.copy()
         eff_thicks = thickns.copy()
+        # Sheet strand C-end widening: bump the *very last* sample of
+        # each sheet strand to 1.2 × its original width. The widened
+        # cross-section at that sample gives the strip an arrow-flare
+        # look at the C-terminus. No explicit tip vertex or triangle
+        # needed — the wider cross-section is enough.
+        arrow_strand_end: set[int] = set()
         for k in arrow_samples:
-            eff_widths[k] *= 2.0
+            i_orig = per_sample_orig[k]
+            nxt_orig = ss_list[i_orig + 1] if i_orig + 1 < len(ss_list) else "loop"
+            if nxt_orig != "sheet":
+                arrow_strand_end.add(k)
+        for k in arrow_strand_end:
+            # Wide base: half-width = 1.2 × original sheet width. This
+            # matches _sheet_segment's `wide_left/wide_right` at
+            # `last.ca ± side × width × 1.2` — gives a flat triangular
+            # arrowhead 2.4 × the strip body width.
+            eff_widths[k] = widths[k] * 2.0
             # Arrow stays flat: thickness stays small so it still reads
             # as a flat arrow plate rather than a fat rod.
             eff_thicks[k] = max(eff_thicks[k], sheet_thickness)
+            # Pull the wide cross-section's *center* back along the
+            # chain tangent so it sits at the previous sample's z
+            # (chain-axis) position. The arrow flare widens laterally
+            # at the chain's end z, instead of pushing the strip's
+            # last sample forward past the C-terminus.
+            if k >= 1:
+                positions[k] = positions[k - 1]
 
         # Cross-section: per-sample ellipse in the (side, binormal) plane.
         # Every SS type uses a *flat* ellipse — wider along the side

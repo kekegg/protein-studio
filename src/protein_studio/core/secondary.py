@@ -48,7 +48,21 @@ import numpy as np
 from .molecule import Molecule, Residue
 
 
-HBOND_CUTOFF_DEFAULT = 3.2  # Å — same value 3Dmol.js uses.
+HBOND_CUTOFF_DEFAULT = 3.2  # Å — N...O distance of a "good" backbone
+# H-bond (without the H atom). The same value 3Dmol.js uses.
+#
+# Helix and sheet use different effective cutoffs from this single
+# detection pass:
+#   - α-helix i↔i±4 H-bonds sit around 2.95-3.15 Å, so we keep the
+#     full 3.2 Å cutoff for the helix pass — going tighter starts
+#     dropping real helices.
+#   - β-sheet H-bonds sit around 2.9-3.0 Å and the loose 3.2 Å
+#     cutoff lets in too many false-positive "close contacts" in
+#     the dense protein core. The sheet promotion step filters
+#     candidates down to a tighter SHEET_HBOND_CUTOFF (3.0 Å).
+
+SHEET_HBOND_CUTOFF = 3.0  # Å — tighter cutoff for β-sheet promotion
+# only. See HBOND_CUTOFF_DEFAULT above for why these differ.
 
 
 def _backbone_no_atoms(mol: Molecule):
@@ -78,9 +92,15 @@ def _assign_backbone_hbonds(mol: Molecule, hbond_cutoff: float) -> None:
     ``hbond_distance_sq`` on every backbone N/O atom.
 
     This is the 3Dmol.js ``assignBackboneHBonds`` algorithm: sort
-    backbone atoms by z, then for each pair in a 3.2 Å cube skip
-    pairs in the same chain within 4 residues and pick the closest
-    one. The O(n * k) sweep is fine for n in the thousands.
+    backbone atoms by z, then for each pair in a cube of side
+    ``hbond_cutoff`` skip pairs in the same chain within 4 residues
+    and pick the closest one. The O(n * k) sweep is fine for n in
+    the thousands.
+
+    Default ``hbond_cutoff`` is 3.0 Å (DSSP-like). 3Dmol.js uses
+    3.2 Å but that looser cutoff over-detects sheets in real
+    protein cores; 3.0 Å is closer to DSSP's geometric envelope
+    (going tighter to 2.9 Å drops α-helix i↔i±4 H-bonds).
     """
     max_sq = hbond_cutoff * hbond_cutoff
     atoms = _backbone_no_atoms(mol)
@@ -179,14 +199,18 @@ def _classify_from_hbonds(mol: Molecule) -> int:
 
     # ---- 3. Mark potential sheets: any remaining H-bonded residue
     # that isn't already helix becomes a sheet "candidate".
-    # Track which atoms contributed so we can determine "is sheet"
-    # by paired candidates (3Dmol.js: sheet only if both ends
-    # of the H-bond pair are candidates or already sheet).
+    # Only count H-bonds that are tight enough to be real β-sheet
+    # bonds (within SHEET_HBOND_CUTOFF); the looser 3.2 Å helix
+    # H-bonds above 3.0 Å are filtered out so they don't enter the
+    # sheet candidate pool.
+    sheet_cutoff_sq = SHEET_HBOND_CUTOFF * SHEET_HBOND_CUTOFF
     candidate_residues: set = set()
     for a in mol.atoms:
         if a.name not in ("N", "O"):
             continue
         if a.hbond_other is None or not math.isfinite(a.hbond_distance_sq):
+            continue
+        if a.hbond_distance_sq > sheet_cutoff_sq:
             continue
         cid = a.residue.chain_id if a.residue else None
         if cid is None:
@@ -196,12 +220,16 @@ def _classify_from_hbonds(mol: Molecule) -> int:
         candidate_residues.add((cid, a.residue.number))
 
     # ---- 4. Promote candidates to sheet if both ends of their
-    # H-bond pair are also candidates (or already sheet).
+    # H-bond pair are also candidates (or already sheet). Only H-bonds
+    # within SHEET_HBOND_CUTOFF enter this loop (the tighter sheet
+    # cutoff; the wider 3.2 Å helix cutoff stays for step 1).
     sheet_set: set = set()
     for a in mol.atoms:
         if a.name not in ("N", "O"):
             continue
         if a.hbond_other is None or not math.isfinite(a.hbond_distance_sq):
+            continue
+        if a.hbond_distance_sq > sheet_cutoff_sq:
             continue
         cid = a.residue.chain_id
         other_cid = a.hbond_other.residue.chain_id
