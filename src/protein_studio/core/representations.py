@@ -1226,34 +1226,19 @@ def ribbon(
             # as a flat arrow plate rather than a fat rod.
             eff_thicks[k] = max(eff_thicks[k], sheet_thickness)
 
-        # Cross-section: per-sample ellipse whose LONG axis runs along the
-        # local tangent (= the backbone / helix-axis direction) and
-        # whose SHORT axis is the radial CA→O side direction.
-        #
-        # Why this orientation matches PyMOL / 3Dmol.js on α-helices:
-        #   * An α-helix is held together by i → i+4 backbone H-bonds
-        #     that run *along* the helix axis. The average H-bond
-        #     direction IS the local tangent.
-        #   * Putting the ellipse's long axis along the tangent means
-        #     each cross-section "strip" is a sliver oriented along
-        #     the helix axis — exactly the orientation of the
-        #     H-bonds. Look at a real α-helix from the side: the
-        #     stripe pattern (the H-bonds) runs parallel to the
-        #     helix axis. We want the ribbon to follow that same
-        #     orientation.
-        #   * As you traverse the helix, the CA→O side vector rotates
-        #     ~100°/residue around the backbone (3Dmol.js does this
-        #     too), so consecutive cross-sections also rotate. The
-        #     strip therefore sweeps around the axis once per ~3.6
-        #     residues and closes into a barrel.
-        #   * For β-sheets the tangent doesn't rotate (straight
-        #     strand), so the ellipse stays aligned with the strand
-        #     — same as a flat arrow plate with the arrowhead
-        #     widening at the C-end.
-        #   * Loop residues have a small radial side vector that
-        #     doesn't strongly rotate, so the cross-section stays
-        #     slim and oriented with the local tangent — reads as
-        #     a thin tube along the chain.
+        # Cross-section: per-sample ellipse in the (side, binormal) plane.
+        # Every SS type uses a *flat* ellipse — wider along the side
+        # direction (where the ribbon's "face" lives), thinner along
+        # the binormal. The flat ellipse is the strip you see at each
+        # residue; it's the rotation of this strip around the backbone
+        # (driven by the CA→O side vector flipping with the helix)
+        # that closes the ribbon into a cylindrical barrel after one
+        # full turn. Sheets get a wider-but-still-flat arrow plate;
+        # helices and loops get the ribbon width but stay flat.
+        # The old `t * 0.5` factor is the binormal half-axis — it
+        # gives the strip a thin "edge" view so it reads as a
+        # rectangle from the side, and a wider "face" view along
+        # the ribbon's width — matches the look of a PyMOL ribbon.
         full = np.zeros((num_cross, n, 3))
         theta = np.linspace(0.0, 2.0 * np.pi, num_cross, endpoint=False)
         cos_t = np.cos(theta)
@@ -1261,17 +1246,12 @@ def ribbon(
         for k in range(n):
             w = eff_widths[k]
             t = eff_thicks[k]
-            tan = tangents[k]
             side_dir = sides[k]
-            # Long axis along the backbone (helix axis for helices,
-            # strand direction for sheets). Short axis along the
-            # radial CA→O direction. The cross-section lies in the
-            # (tangent, side) plane — a flat ribbon strip parallel
-            # to the backbone.
+            bin = binormals[k]
             full[:, k, :] = (
                 positions[k][None, :]
-                + (cos_t * w)[:, None] * tan[None, :]
-                + (sin_t * t * 0.5)[:, None] * side_dir[None, :]
+                + (cos_t * w)[:, None] * side_dir[None, :]
+                + (sin_t * t * 0.5)[:, None] * bin[None, :]
             )
 
         # Per-vertex color (one color per residue, interpolated)
