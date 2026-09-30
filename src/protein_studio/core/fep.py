@@ -2012,6 +2012,40 @@ def build_amber_mutation_system(
     return system, topology, positions, integrator, disappearing
 
 
+def _write_position_snapshot(
+    topology,
+    context,
+    out_dir: str,
+    lam: float,
+) -> None:
+    """Write a single-frame PDB of the current positions.
+
+    Used by both ``run_amber_mutation_fep`` and
+    ``run_ligand_decouple_fep`` when ``position_snapshot_dir`` is
+    given — one PDB per λ window so the user can flip through
+    "how the disappearing atoms decay" in the viewer.
+    """
+    import os
+    openmm, _ = _require_openmm()
+    Path = _require_path()
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    positions = context.getState(getPositions=True).getPositions(
+        asNumpy=True
+    )
+    out_path = Path(out_dir) / f"lambda_{lam:.3f}.pdb"
+    with open(str(out_path), "w") as f:
+        openmm.app.PDBFile.writeFile(topology, positions, f)
+    return str(out_path)
+
+
+def _require_path():
+    """Tiny indirection so the helper above works without a top-level
+    pathlib import (Path is used elsewhere in this module too)."""
+    from pathlib import Path
+    return Path
+
+
 def run_amber_mutation_fep(
     pdb_file: str,
     mutation_residue: int,
@@ -2027,6 +2061,7 @@ def run_amber_mutation_fep(
     sample_neighbor_lambdas: bool = False,
     cancellation_check: Optional[Callable[[], bool]] = None,
     window_callback: Optional[Callable[[Dict[float, List[float]], Dict[float, List[Any]], List[float]], None]] = None,
+    position_snapshot_dir: Optional[str] = None,
 ):
     """Production-grade FEP for a sidechain-truncation mutation.
 
@@ -2235,6 +2270,16 @@ def run_amber_mutation_fep(
                 list(lambdas[: i + 1]),
             )
 
+        # Per-λ position snapshot for visualisation. Writes
+        # ``<dir>/lambda_<value>.pdb`` with the positions after the
+        # current window's sampling — the GUI / MCP layer can
+        # load these as a sequence of SceneObjects to flip through
+        # "how the ligand (or sidechain) gradually disappears".
+        if position_snapshot_dir is not None:
+            _write_position_snapshot(
+                topology, context, position_snapshot_dir, lam,
+            )
+
     del context
 
     if not sample_neighbor_lambdas:
@@ -2368,6 +2413,7 @@ def run_ligand_decouple_fep(
     boresch_kwargs: Optional[dict] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     window_callback: Optional[Callable[[Dict[float, List[float]], Dict[float, List[Any]], List[float]], None]] = None,
+    position_snapshot_dir: Optional[str] = None,
 ):
     """Run FEP for ligand decoupling — both the complex and
     solution sides of a double-decoupling binding free energy.
@@ -2500,6 +2546,12 @@ def run_ligand_decouple_fep(
                 {l: list(energies_by_lambda[l]) for l in lambdas},
                 {l: list(neighbor_energies[l]) for l in lambdas},
                 list(lambdas[: i + 1]),
+            )
+
+        # Per-λ position snapshot for visualisation.
+        if position_snapshot_dir is not None:
+            _write_position_snapshot(
+                topology, context, position_snapshot_dir, lam,
             )
 
     del context

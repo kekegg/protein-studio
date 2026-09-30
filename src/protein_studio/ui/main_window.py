@@ -257,6 +257,7 @@ class MainWindow(QMainWindow):
         dock = getattr(self, "_fep_dock", None)
         if dock is None:
             dock = FEPDockWidget(self)
+            dock.set_api(self.api)
             self._fep_dock = dock
             self.addDockWidget(Qt.RightDockWidgetArea, dock)
         dock.show()

@@ -359,6 +359,7 @@ def fep_run_sweep_with_checkpoint(
     checkpoint_path: Optional[str] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     progress_callback: Optional[Callable] = None,
+    position_snapshot_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a full λ-sweep with optional checkpoint save + resume.
 
@@ -465,6 +466,8 @@ def fep_run_sweep_with_checkpoint(
             run_kwargs = dict(common_kwargs)
             if remaining is not None:
                 run_kwargs["lambdas"] = remaining
+            if position_snapshot_dir is not None:
+                run_kwargs["position_snapshot_dir"] = position_snapshot_dir
             energies, neighbors, disappearing = (
                 fep_core.run_amber_mutation_fep(
                     str(p),
@@ -482,6 +485,8 @@ def fep_run_sweep_with_checkpoint(
             run_kwargs = dict(common_kwargs)
             if remaining is not None:
                 run_kwargs["lambdas"] = remaining
+            if position_snapshot_dir is not None:
+                run_kwargs["position_snapshot_dir"] = position_snapshot_dir
             energies, neighbors, disappearing, boresch_refs = (
                 fep_core.run_ligand_decouple_fep(
                     str(p),
@@ -794,3 +799,248 @@ def fep_best_reference(
                 "target": target,
                 "pdb_file": pdb_file}
     return {"status": "ok", "reference": ref.to_dict()}
+
+
+# ---------------------------------------------------------------------------
+# Visualisation helpers
+# ---------------------------------------------------------------------------
+
+def fep_get_disappearing_atoms(
+    pdb_path: str,
+    mode: str,
+    mutation: Optional[Union[str, int]] = None,
+    ligand_resname: Optional[str] = None,
+    output_pdb: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Identify the atoms being alchemically decoupled.
+
+    Builds the system (no MD) and returns the disappearing-atom
+    indices plus, optionally, a filtered PDB containing just those
+    atoms. The GUI uses the filtered PDB to load a separate
+    SceneObject (typically ball+stick) that highlights which atoms
+    the sweep is removing.
+
+    Args:
+        pdb_path: Absolute path to a PDB file on disk.
+        mode: ``"mutation"`` or ``"ligand_decouple"``.
+        mutation: For mutation mode, the residue id (``"Lys6"``).
+        ligand_resname: For ligand mode, the residue name.
+        output_pdb: If given, write a filtered PDB containing only
+            the disappearing atoms to this path. The GUI passes
+            a path under its temp dir so the load is automatic.
+
+    Returns:
+        Dict with ``status``, ``mode``, ``n_disappearing``,
+        ``atom_indices`` (list of int), ``residue_summary`` (one
+        entry per residue that disappears), and ``output_pdb``
+        if written.
+    """
+    p = Path(pdb_path)
+    if not p.exists():
+        return {"status": "error",
+                "error": f"PDB file not found: {p}"}
+    if mode not in ("mutation", "ligand_decouple"):
+        return {"status": "error",
+                "error": f"Unknown mode: {mode}"}
+
+    try:
+        from . import fep as fep_core
+
+        if mode == "mutation":
+            if mutation is None:
+                return {"status": "error",
+                        "error": "mutation mode requires `mutation` arg"}
+            residue_idx = (
+                _parse_residue_id(mutation, str(p))
+                if isinstance(mutation, str) else int(mutation)
+            )
+            system, topology, _, _, disappearing = (
+                fep_core.build_amber_mutation_system(
+                    str(p), mutation_residue=residue_idx,
+                )
+            )
+        else:
+            if ligand_resname is None:
+                return {"status": "error",
+                        "error": "ligand_decouple mode requires `ligand_resname` arg"}
+            system, topology, _, _, disappearing = (
+                fep_core.build_ligand_decouple_system(
+                    str(p), ligand_resnames=[ligand_resname],
+                )
+            )
+
+        # Build a residue-level summary so the GUI can show
+        # "this is what disappears" without parsing PDB records.
+        by_residue: Dict[str, List[int]] = {}
+        for atom_idx in disappearing:
+            try:
+                atom = topology.atom(atom_idx)
+                resname = atom.residue.name
+                resseq = atom.residue.id
+                key = f"{resname}{resseq}"
+                by_residue.setdefault(key, []).append(int(atom_idx))
+            except Exception:
+                continue
+
+        residue_summary = [
+            {"residue": k, "atom_indices": sorted(v)}
+            for k, v in sorted(by_residue.items())
+        ]
+
+        result = {
+            "status": "ok",
+            "mode": mode,
+            "n_disappearing": len(disappearing),
+            "atom_indices": [int(i) for i in disappearing],
+            "residue_summary": residue_summary,
+        }
+
+        if output_pdb:
+            out = Path(output_pdb)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            _write_subset_pdb(p, topology, disappearing, str(out))
+            result["output_pdb"] = str(out)
+
+        return result
+    except Exception as e:
+        return {"status": "error",
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc()}
+
+
+def _write_subset_pdb(
+    src_pdb_path: str,
+    topology,
+    keep_indices,
+    out_path: str,
+) -> None:
+    """Write a new PDB containing only the atoms at ``keep_indices``.
+
+    Uses OpenMM's PDBFile infrastructure so the output has the same
+    atom numbering scheme (serial numbers, chain IDs, residue
+    records, CRYST1) as the source topology.
+    """
+    import openmm
+    n_atoms = topology.getNumAtoms() if topology is not None else None
+    keep_set = set(int(i) for i in keep_indices)
+
+    # Read source PDB lines and filter.
+    src_lines = open(src_pdb_path).readlines()
+    out_lines = []
+    serial_map = {}  # old serial → new serial
+    new_serial = 1
+    for line in src_lines:
+        rec = line[:6]
+        if rec in ("ATOM  ", "HETATM"):
+            try:
+                serial = int(line[6:11].strip())
+            except ValueError:
+                continue
+            # Map source serial to atom index in topology: serial is
+            # 1-based, atom index is 0-based.
+            atom_idx = serial - 1
+            if n_atoms is not None and not (
+                0 <= atom_idx < n_atoms
+            ):
+                continue
+            if atom_idx not in keep_set:
+                continue
+            if atom_idx not in serial_map:
+                serial_map[atom_idx] = new_serial
+                new_serial += 1
+            new_s = serial_map[atom_idx]
+            # Replace the serial in the line.
+            new_line = (
+                line[:6]
+                + f"{new_s:>5d}"
+                + line[11:]
+            )
+            out_lines.append(new_line)
+        elif rec.strip() in (
+            "CRYST1", "HEADER", "TITLE", "COMPND", "SOURCE",
+            "KEYWDS", "EXPDTA", "AUTHOR", "REVDAT", "REMARK",
+            "DBREF", "SEQRES", "FORMUL", "HET", "HETNAM",
+            "HETSYN", "FORMUL", "SITE", "END", "MODEL",
+            "ENDMDL", "TER", "ANISOU", "SIGUIJ", "TER",
+            "MASTER", "END",
+        ) or rec.startswith("CRYST"):
+            out_lines.append(line)
+
+    with open(out_path, "w") as f:
+        f.writelines(out_lines)
+
+
+def fep_capture_lambda_snapshots(
+    pdb_path: str,
+    mode: str,
+    recipe_name: str = "quick_test",
+    mutation: Optional[Union[str, int]] = None,
+    ligand_resname: Optional[str] = None,
+    output_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run a sweep and save one PDB per λ window.
+
+    The output directory contains ``lambda_<value>.pdb`` files,
+    one per completed λ window, that can be loaded as separate
+    scene objects to visualise how the disappearing atoms decay
+    across the sweep.
+
+    Args:
+        pdb_path: PDB file.
+        mode: ``"mutation"`` or ``"ligand_decouple"``.
+        recipe_name: Recipe preset.
+        mutation / ligand_resname: target.
+        output_dir: Where to write the per-λ PDBs. Defaults to
+            ``<pdb_dir>/fep_snapshots/<pdb_stem>_<mode>_<target>``.
+
+    Returns:
+        Dict with ``status``, ``output_dir``, ``snapshots`` (list
+        of dicts with ``lambda`` and ``pdb_path``), and the
+        regular BAR analysis fields. On cancellation,
+        ``status="interrupted"`` and only the completed snapshots
+        are listed.
+    """
+    p = Path(pdb_path)
+    if not p.exists():
+        return {"status": "error",
+                "error": f"PDB file not found: {p}"}
+
+    if output_dir is None:
+        target = mutation if mutation else ligand_resname or "x"
+        safe_target = str(target).replace("/", "_").replace("\\", "_")
+        output_dir = str(
+            p.parent / "fep_snapshots" / f"{p.stem}_{mode}_{safe_target}"
+        )
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Delegate to the checkpointed sweep — same cancellation /
+    # resume semantics, with position_snapshot_dir plumbed through
+    # so the core runner writes one PDB per completed λ window.
+    result = fep_run_sweep_with_checkpoint(
+        pdb_path=pdb_path,
+        mode=mode,
+        recipe_name=recipe_name,
+        mutation=mutation,
+        ligand_resname=ligand_resname,
+        position_snapshot_dir=output_dir,
+    )
+
+    # Build the snapshots manifest from the output dir (it may be
+    # partial if the sweep was interrupted).
+    snapshots = []
+    snap_path = Path(output_dir)
+    if snap_path.exists():
+        for f in sorted(snap_path.glob("lambda_*.pdb")):
+            try:
+                lam_str = f.stem.replace("lambda_", "")
+                lam = float(lam_str)
+            except ValueError:
+                continue
+            snapshots.append({"lambda": lam, "pdb_path": str(f)})
+
+    return {
+        **result,
+        "snapshot_dir": output_dir,
+        "snapshots": snapshots,
+    }

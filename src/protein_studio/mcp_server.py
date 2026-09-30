@@ -293,6 +293,31 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
          "target": {"type": "string"},
          "pdb_file": {"type": "string"},
      }, "required": ["mode"], "additionalProperties": False}},
+    {"name": "fep_get_disappearing_atoms", "description": (
+        "Identify the atoms being alchemically decoupled by an FEP "
+        "sweep (no MD). Optionally writes a filtered PDB containing "
+        "only those atoms so the GUI can load it as a separate "
+        "SceneObject (e.g. ball+stick) to highlight them."),
+     "inputSchema": {"type": "object", "properties": {
+         "pdb_path": {"type": "string"},
+         "mode": {"type": "string", "enum": ["mutation", "ligand_decouple"]},
+         "mutation": {"type": "string"},
+         "ligand_resname": {"type": "string"},
+         "output_pdb": {"type": "string"},
+     }, "required": ["pdb_path", "mode"], "additionalProperties": False}},
+    {"name": "fep_capture_lambda_snapshots", "description": (
+        "Run a sweep and save one PDB per λ window to "
+        "output_dir/lambda_<value>.pdb. The GUI can then load "
+        "each frame as a SceneObject so the user can flip through "
+        "'how the ligand / sidechain gradually disappears'."),
+     "inputSchema": {"type": "object", "properties": {
+         "pdb_path": {"type": "string"},
+         "mode": {"type": "string", "enum": ["mutation", "ligand_decouple"]},
+         "recipe_name": {"type": "string", "default": "quick_test"},
+         "mutation": {"type": "string"},
+         "ligand_resname": {"type": "string"},
+         "output_dir": {"type": "string"},
+     }, "required": ["pdb_path", "mode"], "additionalProperties": False}},
 ]
 
 
@@ -546,6 +571,30 @@ def _dispatch(name: str, arguments: Dict[str, Any],
         if "pdb_file" in arguments:
             kwargs["pdb_file"] = arguments["pdb_file"]
         return _fep_best(**kwargs)
+    if name == "fep_get_disappearing_atoms":
+        from .core.fep_mcp import (
+            fep_get_disappearing_atoms as _fep_disap,
+        )
+        kwargs = {"mode": arguments["mode"]}
+        if "mutation" in arguments:
+            kwargs["mutation"] = arguments["mutation"]
+        if "ligand_resname" in arguments:
+            kwargs["ligand_resname"] = arguments["ligand_resname"]
+        if "output_pdb" in arguments:
+            kwargs["output_pdb"] = arguments["output_pdb"]
+        return _fep_disap(arguments["pdb_path"], **kwargs)
+    if name == "fep_capture_lambda_snapshots":
+        from .core.fep_mcp import (
+            fep_capture_lambda_snapshots as _fep_snap,
+        )
+        kwargs = {"recipe_name": arguments.get("recipe_name", "quick_test")}
+        if "mutation" in arguments:
+            kwargs["mutation"] = arguments["mutation"]
+        if "ligand_resname" in arguments:
+            kwargs["ligand_resname"] = arguments["ligand_resname"]
+        if "output_dir" in arguments:
+            kwargs["output_dir"] = arguments["output_dir"]
+        return _fep_snap(arguments["pdb_path"], arguments["mode"], **kwargs)
     raise ValueError(f"unknown tool: {name}")
 
 

@@ -36,8 +36,11 @@ from PySide6.QtWidgets import (
 from ..core import fep_recipes
 from ..core.fep_mcp import (
     fep_build_system,
+    fep_capture_lambda_snapshots,
     fep_configure_recipe,
+    fep_get_disappearing_atoms,
     fep_run_sweep,
+    fep_run_sweep_with_checkpoint,
 )
 
 
@@ -70,6 +73,7 @@ class FEPRunWorker(QObject):
         ligand_resname: Optional[str],
         checkpoint_path: Optional[str] = None,
         resume_from: Optional[str] = None,
+        position_snapshot_dir: Optional[str] = None,
     ):
         super().__init__()
         self._pdb_path = pdb_path
@@ -79,6 +83,7 @@ class FEPRunWorker(QObject):
         self._ligand_resname = ligand_resname
         self._checkpoint_path = checkpoint_path
         self._resume_from = resume_from
+        self._snapshot_dir = position_snapshot_dir
         # Atomic flag the GUI can flip from the main thread.
         from threading import Event
         self._cancel = Event()
@@ -126,6 +131,7 @@ class FEPRunWorker(QObject):
                     ligand_resname=self._ligand_resname,
                     checkpoint_path=self._checkpoint_path,
                     cancellation_check=self._cancelled,
+                    position_snapshot_dir=self._snapshot_dir,
                 )
             self.finished.emit(result)
         except Exception as e:
@@ -143,6 +149,7 @@ class FEPPanel(QWidget):
         super().__init__(parent)
         self._thread: Optional[QThread] = None
         self._worker: Optional[FEPRunWorker] = None
+        self._api = None  # StudioAPI handle; set by FEPDockWidget.set_api
         self._build_ui()
         self._on_mode_changed("mutation")
         self._on_recipe_changed("quick_test")
@@ -206,6 +213,16 @@ class FEPPanel(QWidget):
         self._build_result.setWordWrap(True)
         form.addRow(self._build_result)
 
+        # Highlight disappearing atoms button.
+        self._highlight_btn = QPushButton(
+            "Highlight disappearing atoms in viewport"
+        )
+        self._highlight_btn.clicked.connect(self._on_highlight)
+        form.addRow(self._highlight_btn)
+        self._highlight_result = QLabel("")
+        self._highlight_result.setWordWrap(True)
+        form.addRow(self._highlight_result)
+
         # Run tab --------------------------------------------------------
         run = QWidget()
         run_layout = QVBoxLayout(run)
@@ -242,6 +259,26 @@ class FEPPanel(QWidget):
         cp_row.addWidget(self._cp_edit)
         cp_row.addWidget(cp_browse)
         run_layout.addLayout(cp_row)
+
+        # Snapshot output row (per-λ PDBs for visualisation).
+        snap_row = QHBoxLayout()
+        from PySide6.QtWidgets import QCheckBox
+        self._snap_check = QCheckBox("Save per-λ snapshots")
+        self._snap_check.setChecked(True)
+        snap_row.addWidget(self._snap_check)
+        self._snap_edit = QLineEdit()
+        self._snap_edit.setPlaceholderText(
+            "(default — <pdb_dir>/fep_snapshots/...)"
+        )
+        self._snap_browse = QPushButton("…")
+        self._snap_browse.clicked.connect(self._on_snap_browse)
+        snap_row.addWidget(QLabel("Snapshots dir:"))
+        snap_row.addWidget(self._snap_edit)
+        snap_row.addWidget(self._snap_browse)
+        run_layout.addLayout(snap_row)
+        self._snap_result = QLabel("")
+        self._snap_result.setWordWrap(True)
+        run_layout.addWidget(self._snap_result)
 
         self._run_result = QPlainTextEdit()
         self._run_result.setReadOnly(True)
@@ -322,6 +359,83 @@ class FEPPanel(QWidget):
                 f"✗ {result.get('error', 'unknown error')}"
             )
 
+    def _on_highlight(self) -> None:
+        """Build the system, write a filtered PDB of just the
+        disappearing atoms, and load it as a new SceneObject so
+        the user can see exactly which atoms the sweep is removing.
+        """
+        path = self._pdb_edit.text().strip()
+        if not path:
+            self._highlight_result.setText(
+                "⚠ Select a PDB file first."
+            )
+            return
+        mode = self._mode_combo.currentText()
+        kwargs = {}
+        if mode == "mutation":
+            kwargs["mutation"] = self._mutation_edit.text().strip() or None
+        else:
+            kwargs["ligand_resname"] = (
+                self._ligand_edit.text().strip() or None
+            )
+
+        # Write the filtered PDB to a sibling location so the GUI
+        # can also keep it around for re-loads.
+        from pathlib import Path
+        pdb = Path(path)
+        target = kwargs.get("mutation") or kwargs.get("ligand_resname") or "x"
+        out_pdb = str(
+            pdb.parent / f"{pdb.stem}_{mode}_disappearing_{target}.pdb"
+        )
+
+        result = fep_get_disappearing_atoms(
+            pdb_path=path,
+            mode=mode,
+            output_pdb=out_pdb,
+            **kwargs,
+        )
+        if result.get("status") != "ok":
+            self._highlight_result.setText(
+                f"✗ {result.get('error')}"
+            )
+            return
+
+        # Hand the file off to the GUI's main API to load as a
+        # separate SceneObject (ball+stick rep, "element" scheme
+        # so each atom is colored by element type).
+        api = self._api
+        if api is None:
+            # Fall back: just record the output path.
+            self._highlight_result.setText(
+                f"✓ {result['n_disappearing']} disappearing atoms. "
+                f"Filtered PDB: {result.get('output_pdb', out_pdb)} "
+                f"(couldn't access GUI API to load automatically — "
+                f"open the file via File → Open PDB…)"
+            )
+            return
+
+        try:
+            stem = Path(out_pdb).stem
+            obj = api.load(
+                out_pdb,
+                name=f"{stem} (alchemical)",
+                representation="ball_and_stick",
+                scheme="element",
+            )
+            res_summary = ", ".join(
+                f"{r['residue']} ({len(r['atom_indices'])} atoms)"
+                for r in result.get("residue_summary", [])
+            )
+            self._highlight_result.setText(
+                f"✓ Highlighted {result['n_disappearing']} "
+                f"disappearing atoms: {res_summary}"
+            )
+        except Exception as e:
+            self._highlight_result.setText(
+                f"✓ wrote filtered PDB to {out_pdb} but failed to "
+                f"load: {e}"
+            )
+
     def _on_run(self) -> None:
         path = self._pdb_edit.text().strip()
         if not path:
@@ -350,6 +464,13 @@ class FEPPanel(QWidget):
         self._run_status.setText("Starting…")
 
         cp_path = self._cp_edit.text().strip() or None
+        snap_dir = (
+            self._snap_edit.text().strip()
+            if self._snap_check.isChecked() else None
+        )
+        if snap_dir:
+            from pathlib import Path
+            Path(snap_dir).mkdir(parents=True, exist_ok=True)
         self._thread = QThread()
         self._worker = FEPRunWorker(
             pdb_path=path,
@@ -358,6 +479,7 @@ class FEPPanel(QWidget):
             mutation=mutation,
             ligand_resname=ligand,
             checkpoint_path=cp_path,
+            position_snapshot_dir=snap_dir,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -412,6 +534,13 @@ class FEPPanel(QWidget):
         if path:
             self._cp_edit.setText(path)
 
+    def _on_snap_browse(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Pick snapshot output directory", ""
+        )
+        if path:
+            self._snap_edit.setText(path)
+
     def _on_progress(self, info: dict) -> None:
         stage = info.get("stage")
         if stage == "starting":
@@ -447,6 +576,16 @@ class FEPPanel(QWidget):
             )
             self._run_result.setPlainText(json.dumps(result, indent=2))
             self._open_analyze_btn.setEnabled(True)
+            # If snapshots were enabled, list what was captured.
+            snap_dir = self._snap_edit.text().strip()
+            if snap_dir and self._snap_check.isChecked():
+                from pathlib import Path
+                snap_files = sorted(Path(snap_dir).glob("lambda_*.pdb"))
+                if snap_files:
+                    self._snap_result.setText(
+                        f"✓ {len(snap_files)} per-λ snapshots in {snap_dir}. "
+                        f"Load them via File → Open PDB… to flip through."
+                    )
         elif status == "interrupted":
             n_done = result.get("n_completed", 0)
             n_total = len(result.get("completed_lambdas", [])) + len(
@@ -512,3 +651,12 @@ class FEPDockWidget(QDockWidget):
         # Sensible default size: a horizontal strip when first
         # detached, vertical strip when docked on the right.
         self.resize(520, 600)
+        self._api = None  # set later via set_api() from main_window
+
+    def set_api(self, api) -> None:
+        """Hand the StudioAPI handle to the panel so visualisation
+        actions (highlight disappearing atoms, load snapshot PDBs)
+        can drop them straight into the scene."""
+        self._api = api
+        if self.widget() is not None:
+            self.widget()._api = api
