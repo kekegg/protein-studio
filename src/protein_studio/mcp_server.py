@@ -199,6 +199,40 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "code": {"type": "string"},
      }, "required": ["code"], "additionalProperties": False}},
+    {"name": "fep_build_system", "description": (
+        "Build an alchemical FEP system from a PDB file. Returns "
+        "metadata (n_particles, n_waters, n_disappearing, etc.) "
+        "without running any MD. Use `mutation` for sidechain "
+        "truncation FEP (e.g. 'Lys6') or `ligand_resname` for "
+        "ligand decouple FEP (e.g. 'LIG')."),
+     "inputSchema": {"type": "object", "properties": {
+         "pdb_path": {"type": "string"},
+         "mutation": {"type": "string",
+                      "description": "Residue id like 'Lys6' or '6'."},
+         "ligand_resname": {"type": "string"},
+         "restraint_k_k_jmol_nm2": {"type": "number", "default": 50000.0},
+     }, "required": ["pdb_path"], "additionalProperties": False}},
+    {"name": "fep_configure_recipe", "description": (
+        "Return the named FEP recipe's full parameter set. "
+        "Recipes bundle n_lambdas, equilibration/production steps, "
+        "sampling stride, and neighbor-re-eval settings. Pass "
+        "name='list' to see all available recipes."),
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string"},
+     }, "required": ["name"], "additionalProperties": False}},
+    {"name": "fep_run_sweep", "description": (
+        "Run a full lambda-sweep + BAR analysis on a PDB and "
+        "return delta_G. Long-running (minutes to hours for "
+        "production recipes) — start with recipe_name='quick_test' "
+        "to validate the pipeline. Returns per-window breakdown "
+        "and uncertainty."),
+     "inputSchema": {"type": "object", "properties": {
+         "pdb_path": {"type": "string"},
+         "mode": {"type": "string", "enum": ["mutation", "ligand_decouple"]},
+         "recipe_name": {"type": "string", "default": "quick_test"},
+         "mutation": {"type": "string"},
+         "ligand_resname": {"type": "string"},
+     }, "required": ["pdb_path", "mode"], "additionalProperties": False}},
 ]
 
 
@@ -381,6 +415,35 @@ def _dispatch(name: str, arguments: Dict[str, Any],
         }
     if name == "run_python":
         return _run_python(api, arguments["code"])
+    if name == "fep_build_system":
+        # Lazy import — OpenMM is heavy.
+        from .core.fep_mcp import fep_build_system as _fep_build
+        kwargs = {}
+        if "mutation" in arguments:
+            kwargs["mutation"] = arguments["mutation"]
+        if "ligand_resname" in arguments:
+            kwargs["ligand_resname"] = arguments["ligand_resname"]
+        if "restraint_k_k_jmol_nm2" in arguments:
+            kwargs["restraint_k_kJmol_nm2"] = (
+                arguments["restraint_k_k_jmol_nm2"]
+            )
+        return _fep_build(arguments["pdb_path"], **kwargs)
+    if name == "fep_configure_recipe":
+        from .core.fep_mcp import (
+            fep_configure_recipe as _fep_cfg,
+            fep_list_recipes as _fep_list,
+        )
+        if arguments["name"] == "list":
+            return _fep_list()
+        return _fep_cfg(arguments["name"])
+    if name == "fep_run_sweep":
+        from .core.fep_mcp import fep_run_sweep as _fep_run
+        kwargs = {"recipe_name": arguments.get("recipe_name", "quick_test")}
+        if "mutation" in arguments:
+            kwargs["mutation"] = arguments["mutation"]
+        if "ligand_resname" in arguments:
+            kwargs["ligand_resname"] = arguments["ligand_resname"]
+        return _fep_run(arguments["pdb_path"], arguments["mode"], **kwargs)
     raise ValueError(f"unknown tool: {name}")
 
 

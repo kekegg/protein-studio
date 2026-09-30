@@ -164,6 +164,13 @@ class MainWindow(QMainWindow):
         m_tools.addAction(self._mcp_stop_action)
         m_tools.addSeparator()
         m_tools.addAction(self._mcp_log_action)
+
+        # Simulate (FEP panel + future analysis tools)
+        m_sim = menubar.addMenu("&Simulate")
+        self._fep_action = self._mk_action(
+            "Free Energy Perturbation…", None, self._on_fep_open)
+        m_sim.addAction(self._fep_action)
+
         self._sync_mcp_actions("stopped")
 
     def _build_toolbar(self) -> None:
@@ -240,6 +247,20 @@ class MainWindow(QMainWindow):
     def _on_mcp_show_log(self) -> None:
         """Open the log dialog (Tools → Show MCP Log…)."""
         self._mcp.show_log(self)
+
+    def _on_fep_open(self) -> None:
+        """Show the FEP control panel dock (Simulate → FEP…)."""
+        # Lazy import — OpenMM is heavy and shouldn't be loaded until
+        # the user actually opens the FEP panel.
+        from .fep_panel import FEPDockWidget
+
+        dock = getattr(self, "_fep_dock", None)
+        if dock is None:
+            dock = FEPDockWidget(self)
+            self._fep_dock = dock
+            self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        dock.show()
+        dock.raise_()
 
     def _on_mcp_btn_toggled(self, checked: bool) -> None:
         """Toolbar MCP pill — toggles the server on/off."""
