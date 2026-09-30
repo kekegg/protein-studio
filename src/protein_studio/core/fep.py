@@ -1308,6 +1308,7 @@ def run_amber_mutation_fep(
     n_steps: int = 100,
     temperature_K: float = 300.0,
     padding_nm: float = 0.8,
+    minimize_iterations: int = 10,
 ):
     """Run FEP for a sidechain-truncation mutation.
 
@@ -1378,16 +1379,21 @@ def run_amber_mutation_fep(
         # Lys-NZ at 0.07 nm from a TIP3P H — and the next λ window
         # then explodes to NaN when its full LJ term kicks in.
         # Starting every window from the reference + minimisation
-        # removes that history dependence.
-        integrator.reset()
+        # removes that history dependence.  (We can't reset the
+        # integrator's internal step counter — LangevinMiddleIntegrator
+        # has no reset() — but context.setPositions() reseeds the
+        # state, which is what we actually need.)
         context.setPositions(positions)
 
         # Minimise at each λ before sampling — even with reference
-        # positions, the λ=1 standard LJ needs ~50 LBFGS iterations
+        # positions, the λ=1 standard LJ needs a few LBFGS iterations
         # to relax any clashes inherited from the unminimised
-        # solvation structure.
+        # solvation structure.  Default 10 is enough for a Phase-4
+        # verification; production runs should use ~50.
         if hasattr(openmm, "LocalEnergyMinimizer"):
-            openmm.LocalEnergyMinimizer.minimize(context, maxIterations=50)
+            openmm.LocalEnergyMinimizer.minimize(
+                context, maxIterations=minimize_iterations,
+            )
 
         energies: List[float] = []
         state = context.getState(getEnergy=True)
