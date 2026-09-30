@@ -925,70 +925,273 @@ def build_amber_solvated_system(
 
 
 def compute_bar(
-    energies_a: Sequence[float],
-    energies_b: Sequence[float],
+    u_a_at_a: Sequence[float],
+    u_b_at_a: Sequence[float],
+    u_a_at_b: Sequence[float],
+    u_b_at_b: Sequence[float],
     kT_kjmol: float = 2.479,
     tol: float = 1e-6,
     max_iter: int = 200,
+    n_bootstrap: int = 200,
 ) -> Tuple[float, float]:
-    """Bennett Acceptance Ratio for two adjacent lambda windows.
+    """Bennett Acceptance Ratio between two neighbouring states A and B.
 
-    For samples drawn from state A (``energies_a``, each entry is the
-    reduced potential U_A at that frame) and samples drawn from state
-    B (``energies_b``, each entry is U_B), returns ``(delta_g, sigma)``
-    in kJ/mol where::
+    Given per-frame reduced potentials U(state A) and U(state B)
+    evaluated at samples drawn from *both* state A and state B,
+    return ``(delta_g, sigma)`` in kJ/mol where ::
 
-        ΔG = kT × log ⟨exp(-(U_B - U_A) / kT)⟩_A
-           /     ⟨exp(-(U_A - U_B) / kT)⟩_B
+        ΔG_AB = kT × log ⟨exp(-(U_B - U_A) / kT)⟩_A
+                    /     ⟨exp(-(U_A - U_B) / kT)⟩_B
 
-    Implementation: the standard iterative solver that finds C such
-    that ``sum_A 1/(1+exp((ΔG-C) + u_i)) = sum_B 1/(1+exp(-(ΔG-C) + u_j))``
-    where u_i = u_B(state_i) - u_A(state_i) for state A samples and
-    u_j = u_A(state_j) - u_B(state_j) for state B samples.  Bootstrap
-    uncertainty from the standard analytical formula.
+    This is the standard Bennett (1976) iterative solver: find ``C``
+    such that
+
+        sum_A 1 / (1 + exp((C + u_i)/kT)) = sum_B 1 / (1 + exp(-(C + u_j)/kT))
+
+    where ``u_i = U_B(state_i) - U_A(state_i)`` for samples drawn
+    from state A and ``u_j = U_A(state_j) - U_B(state_j)`` for
+    samples drawn from state B.
 
     Parameters
     ----------
-    energies_a, energies_b : sequence of float
-        Per-frame reduced potentials (in kJ/mol) at each state.
+    u_a_at_a : sequence of float
+        U_A evaluated at samples drawn from state A (kJ/mol).
+    u_b_at_a : sequence of float
+        U_B evaluated at the *same* samples from state A (kJ/mol).
+    u_a_at_b : sequence of float
+        U_A evaluated at samples drawn from state B (kJ/mol).
+    u_b_at_b : sequence of float
+        U_B evaluated at the *same* samples from state B (kJ/mol).
     kT_kjmol : float
         ``k_B T`` in kJ/mol at 300 K (default 2.479).
+    tol, max_iter : float, int
+        Convergence tolerance and iteration cap for Bennett's solver.
+    n_bootstrap : int
+        Number of bootstrap samples for uncertainty estimation
+        (default 200).
+
+    Notes
+    -----
+    With only single-state samples (no mixed-state re-evaluation),
+    BAR reduces to the Zwanzig exponential-average estimator which
+    is biased for windows that don't overlap.  For an 11-window
+    sweep with Δλ = 0.1 and the soft-core parameters used in
+    Phase 4, neighbouring windows have substantial overlap, so the
+    histogram-overlap estimator is a reasonable approximation
+    when mixed-state energies aren't available — see
+    ``analyze_fep_trapezoidal``.
     """
     import math
-    arr_a = np.asarray(energies_a, dtype=float) / kT_kjmol
-    arr_b = np.asarray(energies_b, dtype=float) / kT_kjmol
+    arr_a = np.asarray(u_a_at_a, dtype=float)
+    arr_b_at_a = np.asarray(u_b_at_a, dtype=float)
+    arr_a_at_b = np.asarray(u_a_at_b, dtype=float)
+    arr_b = np.asarray(u_b_at_b, dtype=float)
     n_a = arr_a.size
     n_b = arr_b.size
     if n_a == 0 or n_b == 0:
         return float("nan"), float("nan")
-    # Δu_a = U_B(state) - U_A(state) for samples from A.  We don't have
-    # mixed-state energies here, so this function assumes the caller
-    # has re-evaluated each frame at both lambdas and packed
-    # ``energies_a`` and ``energies_b`` accordingly.  For Phase-3's
-    # verification we use ``energies_a = u_at_lambda_i`` and
-    # ``energies_b = u_at_lambda_j`` sampled separately — that's the
-    # standard approximation.
-    delta_u_a = arr_a - arr_a  # placeholder (see note above)
-    delta_u_b = arr_b - arr_b
-    # Bootstrap-style direct estimator (Bennett's original):
-    # We approximate ΔG via log(⟨exp(-Δu_a)⟩_a / ⟨exp(+Δu_a)⟩_b).  This
-    # is the histogram-overlap approximation; it works when A and B
-    # are neighbouring states (which is the BAR use case).
-    log_ratio = math.log(
-        float(np.mean(np.exp(-arr_a)) / np.mean(np.exp(-arr_b)))
-    )
-    delta_g = kT_kjmol * log_ratio
-    # Bootstrap uncertainty via 200 bootstrap samples.
+
+    # Δu_A = U_B(state_i) - U_A(state_i) for samples from A.
+    delta_u_a = (arr_b_at_a - arr_a) / kT_kjmol
+    # Δu_B = U_A(state_j) - U_B(state_j) for samples from B.
+    delta_u_b = (arr_a_at_b - arr_b) / kT_kjmol
+
+    def _bar_solve(delta_a: np.ndarray, delta_b: np.ndarray,
+                   c_init: float) -> float:
+        """Iterate Bennett's overlap equation for given Δu arrays.
+
+        Bennett 1976 (Shirts 2008 best-practices form):
+
+            ⟨1/(1+exp(Δu_A − c))⟩_A = ⟨1/(1+exp(Δu_B + c))⟩_B
+
+        where c = β·ΔF (i.e. C in Bennett's notation) and ΔF =
+        F_B − F_A.  At convergence, ΔF = c · kT.
+
+        Strategy: bracket the root then bisect.  The Bennett
+        objective can have very flat regions far from the root
+        (sums saturate to N_A or 0 once |Δu − c| ≫ 0), so a
+        straight Newton solver diverges — every Newton step
+        lands outside the useful region and the next derivative
+        is essentially zero.
+        """
+        def _f(c: float) -> float:
+            # Clip to avoid overflow in exp; fF at large |x| is
+            # exactly 0 or 1 by the formula.
+            arg_a = np.clip(delta_a - c, -500, 500)
+            arg_b = np.clip(delta_b + c, -500, 500)
+            return (
+                float(np.sum(1.0 / (1.0 + np.exp(arg_a)))) -
+                float(np.sum(1.0 / (1.0 + np.exp(arg_b))))
+            )
+
+        # Step 1: bracket.  Search outward from c_init until the
+        # sign of f changes.  f(-∞) = -N_B (sum_B fF of large
+        # positive → 0; sum_A fF of large negative → N_A; so
+        # f(-∞) = N_A - 0 = N_A > 0).  f(+∞) = -N_B < 0.
+        # Wait — recheck: f(c) = Σ_A fF(Δu_A - c) - Σ_B fF(Δu_B + c)
+        #   As c → -∞: Δu_A - c → +∞, fF → 0; Δu_B + c → -∞, fF → 1.
+        #     f → 0 - N_B = -N_B < 0.
+        #   As c → +∞: Δu_A - c → -∞, fF → 1; Δu_B + c → +∞, fF → 0.
+        #     f → N_A - 0 = N_A > 0.
+        # So f(-∞) < 0 and f(+∞) > 0 — there's a unique root.
+        c_low = c_init
+        c_high = c_init
+        step = 1.0
+        for _ in range(60):
+            if _f(c_low) < 0:
+                break
+            c_low -= step
+            step *= 2
+        step = 1.0
+        for _ in range(60):
+            if _f(c_high) > 0:
+                break
+            c_high += step
+            step *= 2
+
+        # Step 2: bisection.
+        for _ in range(max_iter):
+            c_mid = 0.5 * (c_low + c_high)
+            f_mid = _f(c_mid)
+            if abs(f_mid) < tol * 1e3 or (c_high - c_low) < tol:
+                return c_mid
+            if f_mid < 0:
+                c_low = c_mid
+            else:
+                c_high = c_mid
+        return 0.5 * (c_low + c_high)
+
+    # Initial guess: Zwanzig exponential average (one-sided
+    # estimator at state A).  ΔG = -kT · log⟨exp(-β(U_B - U_A))⟩_A
+    # so c_init = ΔG/kT = -log⟨exp(-Δu_a)⟩_A.
+    c_init = -float(np.log(np.mean(np.exp(-delta_u_a))))
+    c = _bar_solve(delta_u_a, delta_u_b, c_init)
+    delta_g = kT_kjmol * c
+
+    # Bootstrap uncertainty.  Resample A and B independently and
+    # solve BAR each time.
     rng = np.random.default_rng(0)
-    boot = np.empty(max_iter, dtype=float)
-    for i in range(max_iter):
+    boot = np.empty(max(n_bootstrap, 2), dtype=float)
+    for bi in range(n_bootstrap):
         idx_a = rng.integers(0, n_a, n_a)
         idx_b = rng.integers(0, n_b, n_b)
-        boot[i] = kT_kjmol * math.log(
-            float(np.exp(-arr_a[idx_a]).mean() /
-                  np.exp(-arr_b[idx_b]).mean())
+        d_a_b = (arr_b_at_a[idx_a] - arr_a[idx_a]) / kT_kjmol
+        d_b_b = (arr_a_at_b[idx_b] - arr_b[idx_b]) / kT_kjmol
+        z = -float(np.log(np.mean(np.exp(-d_a_b))))
+        boot[bi] = kT_kjmol * _bar_solve(d_a_b, d_b_b, z)
+    sigma = float(boot.std(ddof=1)) if n_bootstrap > 1 else 0.0
+    return delta_g, sigma
+
+
+def analyze_fep_bar(
+    energies_by_lambda: dict,
+    neighbor_energies: dict,
+    lambdas: Optional[Sequence[float]] = None,
+    kT_kjmol: float = 2.479,
+) -> Tuple[float, float, List[Tuple[int, float, float]]]:
+    """Total ΔG via Bennett Acceptance Ratio between adjacent λ windows.
+
+    For each adjacent pair (λ_i, λ_{i+1}), the function needs:
+
+      From window-i frames:
+        - u_i_at_i  = energies_by_lambda[λ_i][k]
+        - u_{i+1}_at_i = neighbor_energies[λ_i][k].next (the right
+          element of the tuple)
+
+      From window-(i+1) frames:
+        - u_{i+1}_at_{i+1} = energies_by_lambda[λ_{i+1}][k]
+        - u_i_at_{i+1}    = neighbor_energies[λ_{i+1}][k].prev
+
+    Each pair's BAR ΔG is added to the running total.
+
+    Returns ``(total_delta_g_kJmol, total_sigma_kJmol,
+    [(window_idx, dg, sigma), ...])``.
+    """
+    if lambdas is None:
+        lambdas = sorted(energies_by_lambda.keys())
+    else:
+        lambdas = tuple(float(l) for l in lambdas)
+
+    if not neighbor_energies:
+        raise ValueError(
+            "neighbor_energies is empty — pass sample_neighbor_lambdas=True "
+            "to run_amber_mutation_fep to populate it."
         )
-    sigma = float(boot.std(ddof=1)) if max_iter > 1 else 0.0
+
+    per_window: List[Tuple[int, float, float]] = []
+    total_dg = 0.0
+    # Combine per-pair sigmas in quadrature (uncorrelated pairs
+    # approximation — accurate enough for an 11-window sweep).
+    total_var = 0.0
+    for i in range(len(lambdas) - 1):
+        lam_i = lambdas[i]
+        lam_j = lambdas[i + 1]
+        e_i = energies_by_lambda.get(lam_i, [])
+        e_j = energies_by_lambda.get(lam_j, [])
+        nbr_i = neighbor_energies.get(lam_i, [])
+        nbr_j = neighbor_energies.get(lam_j, [])
+        if not e_i or not e_j or not nbr_i or not nbr_j:
+            per_window.append((i, float("nan"), float("nan")))
+            continue
+        # u_i at samples from i, u_j at samples from i
+        u_i_at_i = np.asarray(e_i)
+        u_j_at_i = np.asarray([t[1] for t in nbr_i])  # "next" entry
+        # u_i at samples from j, u_j at samples from j
+        u_i_at_j = np.asarray([t[0] for t in nbr_j])  # "prev" entry
+        u_j_at_j = np.asarray(e_j)
+        dg, sigma = compute_bar(
+            u_i_at_i, u_j_at_i, u_i_at_j, u_j_at_j,
+            kT_kjmol=kT_kjmol,
+        )
+        per_window.append((i, dg, sigma))
+        total_dg += dg
+        total_var += sigma * sigma
+    return total_dg, float(np.sqrt(total_var)), per_window
+
+
+def analyze_fep_trapezoidal(
+    energies_by_lambda: dict,
+    lambdas: Optional[Sequence[float]] = None,
+) -> Tuple[float, float]:
+    """Total ΔG via trapezoidal integration of ⟨U⟩_λ vs λ.
+
+    Returns ``(delta_g_kJmol, sigma_kJmol)`` where ``sigma`` is the
+    standard error of the per-window mean propagated through the
+    trapezoidal rule (assuming independent windows).
+    """
+    if lambdas is None:
+        lambdas = sorted(energies_by_lambda.keys())
+    else:
+        lambdas = tuple(float(l) for l in lambdas)
+    means = np.asarray(
+        [np.mean(energies_by_lambda[l]) for l in lambdas]
+    )
+    sems = np.asarray(
+        [
+            np.std(energies_by_lambda[l], ddof=1) /
+            max(np.sqrt(len(energies_by_lambda[l])), 1.0)
+            for l in lambdas
+        ]
+    )
+    # Trapezoidal rule over the mean energies.  Use
+    # ``np.trapezoid`` (NumPy ≥ 2.0) if available, else fall
+    # back to ``np.trapz``.
+    trap = getattr(np, "trapezoid", None) or getattr(np, "trapz")
+    delta_g = float(trap(means, lambdas))
+    # Per-window SEM → propagated variance = sum Δλ² × SEM²
+    # (trapezoidal variance estimate).
+    if len(lambdas) >= 2:
+        dlam = np.diff(lambdas)
+        var_terms = np.zeros(len(lambdas))
+        var_terms[0] = (dlam[0] / 2.0) ** 2 * sems[0] ** 2
+        var_terms[-1] = (dlam[-1] / 2.0) ** 2 * sems[-1] ** 2
+        if len(lambdas) > 2:
+            var_terms[1:-1] = (
+                (dlam[:-1] / 2.0 + dlam[1:] / 2.0) ** 2 * sems[1:-1] ** 2
+            )
+        sigma = float(np.sqrt(var_terms.sum()))
+    else:
+        sigma = float("nan")
     return delta_g, sigma
 
 
@@ -1305,33 +1508,99 @@ def run_amber_mutation_fep(
     mutation_residue: int,
     from_resname: str = "LYS",
     lambdas: Optional[Sequence[float]] = None,
-    n_steps: int = 100,
+    n_equilibration_steps: int = 200,
+    n_production_steps: int = 1000,
     temperature_K: float = 300.0,
     padding_nm: float = 0.8,
     minimize_iterations: int = 10,
+    restraint_k_kJmol_nm2: Optional[float] = None,
+    sample_every: int = 1,
+    sample_neighbor_lambdas: bool = False,
 ):
-    """Run FEP for a sidechain-truncation mutation.
+    """Production-grade FEP for a sidechain-truncation mutation.
 
-    Returns ``(energies_by_lambda, disappearing_indices)``.  Apply
-    :func:`compute_bar` or trapezoidal integration to obtain ΔG.
+    Returns a 3-tuple ``(energies_by_lambda, neighbor_energies,
+    disappearing_indices)`` where:
+
+    ``energies_by_lambda[λ]`` is a list of *production* potential
+    energies (kJ/mol) sampled at this λ after the equilibration
+    phase.  Equilibration samples are discarded — this is what
+    makes the returned trajectories a valid ensemble for free-
+    energy estimation.
+
+    ``neighbor_energies`` is a dict of the same shape as
+    ``energies_by_lambda`` containing re-evaluations of the
+    *same frames* at the two adjacent λ values (when they
+    exist).  This is what makes Bennett Acceptance Ratio (BAR)
+    possible — for two neighbouring states we need the
+    difference U(λ_{i+1}) − U(λ_i) evaluated at frames drawn
+    from state i (and vice versa).  Empty dict unless
+    ``sample_neighbor_lambdas=True`` (3× the energy evaluations
+    per saved frame, but no extra memory).
+
+    Parameters
+    ----------
+    lambdas : sequence of float, optional
+        Alchemical coupling schedule.  Default: 11 evenly-spaced
+        windows from 0.0 to 1.0 (Δλ = 0.1).  Production FEP
+        typically uses 11–21 windows; for non-overlapping
+        neighbouring windows the soft-core is too weak to give
+        meaningful histograms.
+    n_equilibration_steps : int
+        Number of MD steps to discard per window after the
+        minimisation.  LangevinMiddleIntegrator needs ~50–200
+        steps to forget the initial positions and equilibrate
+        velocities; default 200.
+    n_production_steps : int
+        Number of MD steps to *keep* per window.  Default 1000;
+        for published-quality ΔG expect 10⁴–10⁵.
+    sample_every : int
+        Stride for production sampling — energies are saved every
+        Nth step to decorrelate the samples (autocorrelation time
+        for protein-sidechain ΔG is ~5–10 steps at 2 fs).
+    restraint_k_kJmol_nm2 : float or None, optional
+        Force constant for the position restraints on disappearing
+        atoms.  If ``None`` (default), uses the value set during
+        ``build_amber_mutation_system`` (1000 kJ/mol/nm²).  Pass
+        ``0.0`` to disable restraints entirely — only useful when
+        the soft-core parameters are tuned to keep disappearing
+        atoms out of close contacts without restraints.
+    sample_neighbor_lambdas : bool
+        When True, also re-evaluate every saved frame at the
+        two adjacent λ values.  Pass to ``analyze_fep_bar`` for
+        proper BAR / MBAR.  Default False to keep verification
+        runs fast.
     """
     openmm, unit = _require_openmm()
     if lambdas is None:
-        lambdas = (0.0, 0.25, 0.5, 0.75, 1.0)
+        lambdas = tuple(i / 10.0 for i in range(11))  # 11 windows
+    lambdas = tuple(float(l) for l in lambdas)
+    n_windows = len(lambdas)
 
-    system, topology, positions, integrator, disappearing = (
-        build_amber_mutation_system(
-            pdb_file,
-            mutation_residue=mutation_residue,
-            from_resname=from_resname,
-            padding_nm=padding_nm,
-            temperature_K=temperature_K,
-            lambda_value=1.0,  # initial value; updated per window
+    if restraint_k_kJmol_nm2 is None:
+        system, topology, positions, integrator, disappearing = (
+            build_amber_mutation_system(
+                pdb_file,
+                mutation_residue=mutation_residue,
+                from_resname=from_resname,
+                padding_nm=padding_nm,
+                temperature_K=temperature_K,
+                lambda_value=1.0,
+            )
         )
-    )
+    else:
+        system, topology, positions, integrator, disappearing = (
+            build_amber_mutation_system(
+                pdb_file,
+                mutation_residue=mutation_residue,
+                from_resname=from_resname,
+                padding_nm=padding_nm,
+                temperature_K=temperature_K,
+                lambda_value=1.0,
+                restraint_k_kJmol_nm2=restraint_k_kJmol_nm2,
+            )
+        )
 
-    # Find the soft-core CustomNonbondedForce — we update its ``lam``
-    # global parameter per window via Context.setParameter.
     nb = None
     for f in system.getForces():
         if isinstance(f, openmm.CustomNonbondedForce):
@@ -1344,73 +1613,86 @@ def run_amber_mutation_fep(
     context = openmm.Context(system, integrator, platform)
     context.setPositions(positions)
 
-    energies_by_lambda: dict = {}
+    energies_by_lambda: dict = {lam: [] for lam in lambdas}
+    neighbor_energies: dict = {lam: [] for lam in lambdas}
 
-    # Helper: re-set positions after force changes (replacing a Force
-    # invalidates the Context's stored positions in some OpenMM
-    # versions).
-    def _re_set_positions():
-        # integrator has advanced; reset its step count too
-        integrator.reset()
-        context.setPositions(positions)
-
-    # Re-set positions once in case the force replacement above
-    # wiped them (it shouldn't, but defensive).
+    # Defensive position reset.
     try:
-        pos_check = context.getState(getPositions=True)
         import numpy as np
+        pos_check = context.getState(getPositions=True)
         if np.any(np.isnan(np.asarray(
             [[p.value_in_unit(unit.nanometer) for p in pr]
              for pr in pos_check.getPositions()]
         ))):
-            _re_set_positions()
+            context.setPositions(positions)
     except Exception:
-        _re_set_positions()
+        context.setPositions(positions)
 
-    for lam in lambdas:
+    def _energy_at_current_lam() -> float:
+        """Re-evaluate total energy at the *current* λ value
+        (i.e. whatever was last set via setParameter)."""
+        return context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+            unit.kilojoule_per_mole
+        )
+
+    for i, lam in enumerate(lambdas):
+        # Set this window's λ and make sure the soft-core Force
+        # sees it.
         context.setParameter("lam", float(lam))
-        # Push the parameter change into the running Context.
         nb.updateParametersInContext(context)
-
-        # Reset to the solvated-system reference positions every λ
-        # window.  Without this, the MD from the previous window
-        # leaves disappearing atoms (whose nonbonded interactions are
-        # partly soft-cored) in close-contact configurations — e.g.
-        # Lys-NZ at 0.07 nm from a TIP3P H — and the next λ window
-        # then explodes to NaN when its full LJ term kicks in.
-        # Starting every window from the reference + minimisation
-        # removes that history dependence.  (We can't reset the
-        # integrator's internal step counter — LangevinMiddleIntegrator
-        # has no reset() — but context.setPositions() reseeds the
-        # state, which is what we actually need.)
         context.setPositions(positions)
 
         # Minimise at each λ before sampling — even with reference
-        # positions, the λ=1 standard LJ needs a few LBFGS iterations
-        # to relax any clashes inherited from the unminimised
-        # solvation structure.  Default 10 is enough for a Phase-4
-        # verification; production runs should use ~50.
+        # positions, the λ=1 standard LJ needs a few LBFGS
+        # iterations to relax clashes inherited from the
+        # unminimised solvation structure.
         if hasattr(openmm, "LocalEnergyMinimizer"):
             openmm.LocalEnergyMinimizer.minimize(
                 context, maxIterations=minimize_iterations,
             )
 
-        energies: List[float] = []
-        state = context.getState(getEnergy=True)
-        energies.append(
-            state.getPotentialEnergy().value_in_unit(
-                unit.kilojoule_per_mole
-            )
-        )
-        for _ in range(max(n_steps, 0)):
+        # Equilibration phase: discard these steps so velocities
+        # forget the zero-velocity initial state.
+        for _ in range(max(n_equilibration_steps, 0)):
             integrator.step(1)
-            state = context.getState(getEnergy=True)
-            energies.append(
-                state.getPotentialEnergy().value_in_unit(
-                    unit.kilojoule_per_mole
-                )
-            )
-        energies_by_lambda[float(lam)] = energies
+
+        # Production phase.  At each saved frame we evaluate the
+        # current λ (always) plus the two adjacent λ values
+        # (when sample_neighbor_lambdas=True and the neighbours
+        # exist).
+        prev_lam = lambdas[i - 1] if i > 0 else None
+        next_lam = lambdas[i + 1] if i + 1 < n_windows else None
+        for step in range(max(n_production_steps, 0)):
+            integrator.step(1)
+            if step % max(sample_every, 1) != 0:
+                continue
+
+            u_self = _energy_at_current_lam()
+            energies_by_lambda[lam].append(u_self)
+
+            if sample_neighbor_lambdas:
+                u_prev: Optional[float] = None
+                u_next: Optional[float] = None
+                if prev_lam is not None:
+                    context.setParameter("lam", float(prev_lam))
+                    nb.updateParametersInContext(context)
+                    u_prev = _energy_at_current_lam()
+                if next_lam is not None:
+                    context.setParameter("lam", float(next_lam))
+                    nb.updateParametersInContext(context)
+                    u_next = _energy_at_current_lam()
+                # Restore own λ for the next MD step's force
+                # calculation.
+                context.setParameter("lam", float(lam))
+                nb.updateParametersInContext(context)
+                neighbor_energies[lam].append((u_prev, u_next))
 
     del context
-    return energies_by_lambda, disappearing
+
+    if not sample_neighbor_lambdas:
+        # Backward-compatibility: caller that doesn't ask for
+        # neighbor re-evaluation gets an empty dict instead of
+        # three-element tuple surprise.
+        neighbor_energies = {}
+
+    return energies_by_lambda, neighbor_energies, disappearing

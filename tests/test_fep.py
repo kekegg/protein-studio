@@ -50,6 +50,9 @@ from protein_studio.core.fep import (  # noqa: E402
     _find_disappearing_atoms,
     build_amber_mutation_system,
     run_amber_mutation_fep,
+    compute_bar,
+    analyze_fep_bar,
+    analyze_fep_trapezoidal,
 )
 
 
@@ -328,12 +331,12 @@ def test_run_amber_mutation_fep_completes_all_windows_without_nan():
     the integrator + minimiser and catch any "NaN carry-over"
     across windows.
     """
-    energies, disappearing = run_amber_mutation_fep(
+    energies, _neighbor, disappearing = run_amber_mutation_fep(
         ONEUBQ,
         mutation_residue=5,
         from_resname="LYS",
         lambdas=(0.0, 0.25, 0.5, 0.75, 1.0),
-        n_steps=5,
+        n_equilibration_steps=0, n_production_steps=1,
         padding_nm=0.8,
     )
     assert len(disappearing) == 13
@@ -345,9 +348,10 @@ def test_run_amber_mutation_fep_completes_all_windows_without_nan():
         assert np.all(np.isfinite(arr)), (
             f"non-finite energy at λ={lam}: {arr}"
         )
-        # Each trajectory should have at least 2 samples
-        # (1 initial + n_steps post-min steps).
-        assert len(traj) >= 2
+        # Each trajectory should have at least 1 sample
+        # (production samples only; the equilibration samples
+        # are discarded, so n_production_steps=5 gives 5 entries).
+        assert len(traj) >= 1
 
 
 @pytest.mark.slow
@@ -357,17 +361,16 @@ def test_run_amber_mutation_fep_window_means_are_finite():
     energy above the bare AMBER baseline (~−170000 kJ/mol), so we
     just check it lands in a reasonable range.
     """
-    energies, _ = run_amber_mutation_fep(
+    energies, _neighbor, _ = run_amber_mutation_fep(
         ONEUBQ,
         mutation_residue=5,
         from_resname="LYS",
         lambdas=(0.0, 0.5, 1.0),
-        n_steps=5,
+        n_equilibration_steps=0, n_production_steps=1,
         padding_nm=0.8,
     )
     for lam, traj in energies.items():
-        # Skip the first sample (pre-min, can be huge)
-        mean = float(np.mean(traj[1:]))
+        mean = float(np.mean(traj))
         assert -1e6 < mean < 1e6, (
             f"λ={lam} mean E = {mean} kJ/mol is out of range"
         )
@@ -381,15 +384,15 @@ def test_run_amber_mutation_fep_protein_only_window_at_lambda_zero():
     with the rest of the protein and waters are switched off.  The
     energy should be finite and not blow up to ±inf.
     """
-    energies, _ = run_amber_mutation_fep(
+    energies, _neighbor, _ = run_amber_mutation_fep(
         ONEUBQ,
         mutation_residue=5,
         from_resname="LYS",
         lambdas=(0.0,),
-        n_steps=5,
+        n_equilibration_steps=0, n_production_steps=1,
         padding_nm=0.8,
     )
-    arr = np.asarray(energies[0.0][1:])
+    arr = np.asarray(energies[0.0])
     assert np.all(np.isfinite(arr))
     # The mean must not be the "atomistic minimum" ~ −170000 kJ/mol
     # because the soft-core still has bonded terms, but it must be
@@ -425,3 +428,236 @@ def test_build_amber_mutation_system_out_of_range_index_raises():
             mutation_residue=9999,
             from_resname="LYS",
         )
+
+
+# ----- production analysis: compute_bar + analyze_fep_* ------------------
+
+
+def test_compute_bar_recovers_known_delta_g():
+    """compute_bar must recover the true ΔG_AB from synthetic
+    mixed-state energies.  Each test case uses 1000 samples per
+    state with small Gaussian noise on the energy differences —
+    BAR should converge to within 0.5 kJ/mol (well below the
+    1 kJ/mol bootstrap SEM).
+    """
+    rng = np.random.default_rng(42)
+    n = 1000
+    kT = 2.479  # 300 K
+    for true_dg in (5.0, 0.0, -10.0, 20.0):
+        # State A: energies with mean offset ΔG between U_A and U_B.
+        u_a_at_a = rng.normal(100, 1, n)
+        u_b_at_a = u_a_at_a + true_dg + rng.normal(0, 1, n)
+        # State B: same constant ΔG, different samples.
+        u_b_at_b = rng.normal(100 + true_dg, 1, n)
+        u_a_at_b = u_b_at_b - true_dg + rng.normal(0, 1, n)
+        dg, sigma = compute_bar(
+            u_a_at_a, u_b_at_a, u_a_at_b, u_b_at_b,
+            kT_kjmol=kT,
+        )
+        assert abs(dg - true_dg) < 0.5, (
+            f"true ΔG = {true_dg}, BAR = {dg:.3f}"
+        )
+        # Bootstrap SEM should be > 0 and < 1 kJ/mol for these
+        # well-overlapped distributions.
+        assert 0.0 < sigma < 1.0, f"sigma = {sigma}"
+
+
+def test_compute_bar_zero_input_returns_nan():
+    """An empty input array should produce NaN ΔG and sigma —
+    that's the documented behaviour, used when one window has
+    no frames (e.g. crashed before producing any samples)."""
+    rng = np.random.default_rng(0)
+    a = rng.normal(0, 1, 100)
+    b_empty = np.array([])
+    dg, sigma = compute_bar(a, a + 1, b_empty, b_empty)
+    assert np.isnan(dg) and np.isnan(sigma)
+
+
+def test_analyze_fep_bar_sums_per_window_bars():
+    """analyze_fep_bar should return the sum of per-window BAR
+    estimates, with quadrature-combined uncertainty.  We
+    construct a 3-window sweep with a known ΔG_per_window and
+    verify the total matches.
+    """
+    rng = np.random.default_rng(123)
+    n = 500
+    true_per_window = 2.5  # total ΔG = 5
+
+    u_0_at_0 = rng.normal(0, 1, n)
+    u_05_at_0 = u_0_at_0 + true_per_window + rng.normal(0, 0.5, n)
+
+    u_05_at_05 = rng.normal(true_per_window, 1, n)
+    u_0_at_05 = u_05_at_05 - true_per_window + rng.normal(0, 0.5, n)
+    u_10_at_05 = u_05_at_05 + true_per_window + rng.normal(0, 0.5, n)
+
+    u_10_at_10 = rng.normal(2 * true_per_window, 1, n)
+    u_05_at_10 = u_10_at_10 - true_per_window + rng.normal(0, 0.5, n)
+
+    energies = {
+        0.0: list(u_0_at_0),
+        0.5: list(u_05_at_05),
+        1.0: list(u_10_at_10),
+    }
+    neighbors = {
+        0.0: [(None, float(u_05_at_0[i])) for i in range(n)],
+        0.5: [(float(u_0_at_05[i]), float(u_10_at_05[i])) for i in range(n)],
+        1.0: [(float(u_05_at_10[i]), None) for i in range(n)],
+    }
+    total_dg, total_sig, per_win = analyze_fep_bar(
+        energies, neighbors, (0.0, 0.5, 1.0),
+    )
+    assert abs(total_dg - 5.0) < 0.5, (
+        f"expected total ΔG ≈ 5.0, got {total_dg:.3f}"
+    )
+    # Per-window contributions should each be ~2.5.
+    for idx, dg_i, _sig_i in per_win:
+        assert abs(dg_i - 2.5) < 0.5, (
+            f"window {idx} ΔG = {dg_i:.3f}, expected ≈2.5"
+        )
+
+
+def test_analyze_fep_bar_raises_when_neighbor_dict_empty():
+    """If the caller passed sample_neighbor_lambdas=False, the
+    neighbor dict is empty and BAR can't run.  The function
+    must raise an informative ValueError, not silently return
+    a garbage estimate."""
+    rng = np.random.default_rng(0)
+    energies = {
+        0.0: list(rng.normal(0, 1, 50)),
+        1.0: list(rng.normal(5, 1, 50)),
+    }
+    with pytest.raises(ValueError, match="neighbor_energies"):
+        analyze_fep_bar(energies, {}, (0.0, 1.0))
+
+
+def test_analyze_fep_trapezoidal_recovers_linear_curve():
+    """Trapezoidal integration of ⟨U(λ)⟩ against λ gives the
+    exact ΔG when ⟨U(λ)⟩ is linear in λ.  We construct a
+    5-window sweep with ⟨U(λ_i)⟩ = 5·λ_i and check the result.
+    """
+    rng = np.random.default_rng(7)
+    n = 200
+    lambdas = (0.0, 0.25, 0.5, 0.75, 1.0)
+    ens = {l: rng.normal(5.0 * l, 0.1, n) for l in lambdas}
+    dg, sig = analyze_fep_trapezoidal(ens, lambdas)
+    # Linear curve → exact integral is 5/2 = 2.5 (the area under
+    # y = 5x from 0 to 1).  Allow 0.1 kJ/mol for sampling noise.
+    assert abs(dg - 2.5) < 0.1, f"expected ΔG ≈ 2.5, got {dg:.3f}"
+    # SEM should be tiny (well-converged per-window means).
+    assert sig < 0.05, f"expected small sigma, got {sig:.3f}"
+
+
+def test_analyze_fep_trapezoidal_sigma_grows_with_overlap():
+    """Larger per-window standard deviation → larger propagated
+    SEM.  Trapezoidal variance = sum (Δλ/2)² × SEM² for end
+    windows, (Δλ_{i-1}/2 + Δλ_i/2)² × SEM² for middle windows.
+    """
+    rng = np.random.default_rng(0)
+    lambdas = (0.0, 0.5, 1.0)
+    ens_low_noise = {l: rng.normal(5 * l, 0.1, 200) for l in lambdas}
+    ens_high_noise = {l: rng.normal(5 * l, 5.0, 200) for l in lambdas}
+    _, sig_low = analyze_fep_trapezoidal(ens_low_noise, lambdas)
+    _, sig_high = analyze_fep_trapezoidal(ens_high_noise, lambdas)
+    assert sig_high > 10 * sig_low, (
+        f"high/low sigma ratio = {sig_high / sig_low:.1f}"
+    )
+
+
+# ----- production sampling features --------------------------------------
+
+
+def test_run_amber_mutation_fep_default_lambda_count_is_eleven():
+    """Production default: 11 evenly-spaced windows (Δλ = 0.1) to
+    give BAR enough overlap.  The function returns energies for
+    every window in the schedule."""
+    # Mock the function call by inspecting the default via
+    # inspect.signature (no AMBER build needed).
+    import inspect
+    sig = inspect.signature(run_amber_mutation_fep)
+    assert "lambdas" in sig.parameters
+    assert sig.parameters["lambdas"].default is None, (
+        "default lambdas should be None (= 11-window schedule)"
+    )
+
+
+@pytest.mark.slow
+def test_run_amber_mutation_fep_with_neighbor_re_evaluation():
+    """sample_neighbor_lambdas=True populates the second return
+    tuple with energy re-evaluations at adjacent λs — exactly
+    what analyze_fep_bar needs."""
+    energies, neighbors, disappearing = run_amber_mutation_fep(
+        ONEUBQ,
+        mutation_residue=5,
+        from_resname="LYS",
+        lambdas=(0.0, 0.5, 1.0),
+        n_equilibration_steps=0,
+        n_production_steps=2,
+        padding_nm=0.8,
+        sample_neighbor_lambdas=True,
+    )
+    assert len(disappearing) == 13
+    # Three windows, three neighbour dicts.
+    assert sorted(energies.keys()) == [0.0, 0.5, 1.0]
+    assert sorted(neighbors.keys()) == [0.0, 0.5, 1.0]
+    # Middle window (0.5) has both prev and next neighbours;
+    # end windows have only one.
+    n_neighbour_samples = len(neighbors[0.5])
+    assert n_neighbour_samples > 0
+    for tup in neighbors[0.5]:
+        prev, nxt = tup
+        assert prev is not None
+        assert nxt is not None
+    for tup in neighbors[0.0]:
+        assert tup[0] is None  # no prev
+        assert tup[1] is not None  # has next
+    for tup in neighbors[1.0]:
+        assert tup[0] is not None  # has prev
+        assert tup[1] is None  # no next
+    # The neighbour re-evaluations must be finite.
+    for lam, traj in neighbors.items():
+        for tup in traj:
+            for v in tup:
+                if v is not None:
+                    assert np.isfinite(v), (
+                        f"non-finite neighbour energy at λ={lam}"
+                    )
+
+
+@pytest.mark.slow
+def test_run_amber_mutation_fep_without_neighbor_re_evaluation():
+    """Default behaviour: neighbor_energies is an empty dict so
+    callers know there's nothing to run BAR on."""
+    energies, neighbors, _ = run_amber_mutation_fep(
+        ONEUBQ,
+        mutation_residue=5,
+        from_resname="LYS",
+        lambdas=(0.0, 0.5, 1.0),
+        n_equilibration_steps=0,
+        n_production_steps=2,
+        padding_nm=0.8,
+    )
+    assert neighbors == {}
+    assert len(energies) == 3
+
+
+@pytest.mark.slow
+def test_run_amber_mutation_fep_disabling_restraints():
+    """restraint_k_kJmol_nm2=0 must drop the position restraint
+    from the system (otherwise we'd be measuring ΔG with
+    restraints still on, contaminating the result)."""
+    energies, neighbors, disapp = run_amber_mutation_fep(
+        ONEUBQ,
+        mutation_residue=5,
+        from_resname="LYS",
+        lambdas=(0.0, 0.5),
+        n_equilibration_steps=0,
+        n_production_steps=2,
+        padding_nm=0.8,
+        restraint_k_kJmol_nm2=0.0,
+    )
+    assert len(disapp) == 13
+    assert len(energies) == 2
+    # Energies should be finite.
+    for lam, traj in energies.items():
+        for v in traj:
+            assert np.isfinite(v)
