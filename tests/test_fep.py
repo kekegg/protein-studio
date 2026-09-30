@@ -53,6 +53,7 @@ from protein_studio.core.fep import (  # noqa: E402
     compute_bar,
     analyze_fep_bar,
     analyze_fep_trapezoidal,
+    cartesian_restraint_analytical_correction,
 )
 
 
@@ -661,3 +662,108 @@ def test_run_amber_mutation_fep_disabling_restraints():
     for lam, traj in energies.items():
         for v in traj:
             assert np.isfinite(v)
+
+
+# ----- Cartesian restraint analytical correction -------------------------
+
+
+def test_cartesian_restraint_correction_phase4_default():
+    """Phase 4 default: 13 disappearing atoms, k=1000 kJ/mol/nm²,
+    T=300 K.
+
+    Per-atom ΔG ≈ (3/2) kT ln(2π kT/k) - kT ln(V₀)
+                 ≈ 3.7185 × (-4.161) - 2.479 × (-6.398)
+                 ≈ +0.39 kJ/mol.
+
+    For 13 atoms: ≈ +5.1 kJ/mol total.
+    """
+    corr = cartesian_restraint_analytical_correction(
+        n_atoms=13,
+        restraint_k_kJmol_nm2=1000.0,
+        temperature_K=300.0,
+    )
+    assert 4.5 < corr < 6.0, (
+        f"expected ~5 kJ/mol, got {corr:.3f}"
+    )
+
+
+def test_cartesian_restraint_correction_zero_atoms():
+    """No restrained atoms → no correction."""
+    corr = cartesian_restraint_analytical_correction(
+        n_atoms=0,
+        restraint_k_kJmol_nm2=1000.0,
+    )
+    assert corr == 0.0
+
+
+def test_cartesian_restraint_correction_scales_with_atom_count():
+    """Linear in n_atoms (each restraint is independent)."""
+    c1 = cartesian_restraint_analytical_correction(n_atoms=10, restraint_k_kJmol_nm2=1000.0)
+    c2 = cartesian_restraint_analytical_correction(n_atoms=20, restraint_k_kJmol_nm2=1000.0)
+    assert abs(c2 / c1 - 2.0) < 1e-10, (
+        f"correction should scale linearly: c1={c1:.3f}, c2={c2:.3f}"
+    )
+
+
+def test_cartesian_restraint_correction_stronger_k_larger_correction():
+    """The sign of the correction depends on whether the
+    restrained Gaussian volume is larger or smaller than V₀.
+    At weak k (k ≲ kT/V₀^(2/3) ≈ 1500 kJ/mol/nm²), the
+    Gaussian is wider than V₀ so unrestraining increases F
+    (positive ΔG).  At strong k, the Gaussian is narrower
+    so unrestraining decreases F (negative ΔG).
+
+    This test verifies the SIGN FLIPS — that's the key
+    qualitative behaviour of the analytical correction.
+    """
+    corr_weak = cartesian_restraint_analytical_correction(n_atoms=1, restraint_k_kJmol_nm2=10.0)
+    corr_strong = cartesian_restraint_analytical_correction(n_atoms=1, restraint_k_kJmol_nm2=10000.0)
+    assert corr_weak > 0, (
+        f"weak restraint (k=10) → positive correction, got {corr_weak:.3f}"
+    )
+    assert corr_strong < 0, (
+        f"strong restraint (k=10000) → negative correction, got {corr_strong:.3f}"
+    )
+
+
+def test_cartesian_restraint_correction_temperature_scaling():
+    """Doubling T increases the correction magnitude (kT
+    prefactor + ln(kT) terms give ratio ≈ 2·(3/2 ln(600)+c) /
+    (3/2 ln(300)+c) which for typical V₀ is ~2.5, not exactly 2).
+    """
+    c_300 = cartesian_restraint_analytical_correction(n_atoms=1, restraint_k_kJmol_nm2=100.0, temperature_K=300.0)
+    c_600 = cartesian_restraint_analytical_correction(n_atoms=1, restraint_k_kJmol_nm2=100.0, temperature_K=600.0)
+    ratio = c_600 / c_300
+    # Allow 2.0–3.0 range (kT prefactor alone is 2.0, plus
+    # the ln(kT) terms push it up to ~2.5).
+    assert 2.0 < ratio < 3.0, (
+        f"expected ~2.5x ratio for T doubling, got {ratio:.3f}"
+    )
+
+
+def test_cartesian_restraint_correction_phase4_lysine_sign_and_magnitude():
+    """For Phase 4's specific Lys6→Ala truncation (13
+    disappearing atoms, k=1000), the correction is ~+5
+    kJ/mol.  Sign is positive because the restrained
+    Gaussian volume (1.95e-3 nm³) is comparable to the
+    standard-state volume (1.66e-3 nm³), and the entropic
+    gain from unrestraining is small.
+
+    The fact that this correction is much smaller than the
+    underlying alchemical ΔG (which is hundreds of kJ/mol
+    for losing Lys NZ interactions) is intentional — the
+    restraints are tight enough that they're just keeping
+    the sidechain atoms from drifting during the sweep,
+    not biasing the free-energy estimate significantly.
+    """
+    corr = cartesian_restraint_analytical_correction(
+        n_atoms=13,
+        restraint_k_kJmol_nm2=1000.0,
+    )
+    # Should be much smaller than 50 kJ/mol (the typical
+    # alchemical ΔG for a sidechain truncation).
+    assert abs(corr) < 50, (
+        f"Phase 4 Lys6 correction {corr:.3f} kJ/mol exceeds "
+        "expected bound (restraints shouldn't bias the "
+        "estimate by more than 10% of the alchemical ΔG)"
+    )

@@ -924,6 +924,67 @@ def build_amber_solvated_system(
     )
 
 
+def cartesian_restraint_analytical_correction(
+    n_atoms: int,
+    restraint_k_kJmol_nm2: float = 1000.0,
+    temperature_K: float = 300.0,
+    standard_state_volume_nm3: float = 1.66054e-3,
+) -> float:
+    """Analytical ΔG correction for removing ``n_atoms`` Cartesian
+    harmonic position restraints (Boresch 2003 / Deng & Roux 2009
+    form, specialised to N isotropic position restraints).
+
+    The standard treatment for alchemical FEP is to keep the
+    disappearing atoms' position restraints turned on for the
+    entire λ sweep — that way the system stays in a single
+    metastable basin and the integrator doesn't blow up.  But
+    the physical quantity we want is the ΔG for the *unrestrained*
+    transformation.  So we add an analytical correction:
+
+        ΔG_corrected = ΔG_FEP + ΔG_restraint
+
+    where ΔG_restraint accounts for removing the restraints in
+    the λ=1 (decoupled) state.  Each restrained atom's partition
+    function goes from a Gaussian of width sqrt(kT/k_i) per
+    dimension to the standard-state volume V₀.  Per-atom ΔG::
+
+        ΔG_i = -kT × ln(Z_free / Z_restrained)
+             = -kT × ln(V_0 / (2π kT / k_i)^(3/2))
+             = (3/2) kT × ln(2π kT / k_i) - kT × ln(V_0)
+
+    Parameters
+    ----------
+    n_atoms : int
+        Number of Cartesian position restraints (number of
+        disappearing atoms in Phase 4's sidechain truncation).
+    restraint_k_kJmol_nm2 : float
+        Force constant of the harmonic restraints, in
+        kJ/mol/nm².  Default 1000 (Phase 4's default).
+    temperature_K : float
+        Temperature in K.  Default 300.
+    standard_state_volume_nm3 : float
+        Standard-state volume per particle in nm³.  Default
+        1.66054e-3 (1 mol/L converted to nm³).
+
+    Returns
+    -------
+    float
+        ΔG_restraint in kJ/mol.  Sign convention: this is the
+        ΔG of the *unrestraining* transformation (restrained →
+        free).  Add it to your alchemical ΔG to recover the
+        unrestrained physical ΔG.
+    """
+    kT = 8.314462618e-3 * temperature_K  # kJ/mol
+    k = restraint_k_kJmol_nm2
+    # Per-atom ΔG_unrestrain: log((2π kT / k)^(3/2) / V_0)
+    # = (3/2) ln(2π kT / k) - ln(V_0)
+    per_atom = (
+        1.5 * np.log(2.0 * np.pi * kT / k) -
+        np.log(standard_state_volume_nm3)
+    )
+    return float(kT * n_atoms * per_atom)
+
+
 def compute_bar(
     u_a_at_a: Sequence[float],
     u_b_at_a: Sequence[float],
