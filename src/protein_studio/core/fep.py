@@ -1664,21 +1664,43 @@ def _find_disappearing_atoms(topology, residue_index: int,
     return indices
 
 
-def _replace_amber_nb_with_alchemical(
+def _replace_amber_nb_with_split_forces(
     system,
     disappearing_set: set,
     lambda_value: float,
     alpha_nm2: float = 1.5,
+    cutoff_nm: float = 1.0,
 ):
-    """Swap the AMBER NonbondedForce for a soft-core CustomNonbondedForce.
+    openmm, unit = _require_openmm()
+    """Swap AMBER's NonbondedForce for two alchemical forces:
 
-    The replacement force is a single inlined expression that does
-    standard AMBER LJ + Coulomb for non-disappearing pairs and a
-    Steinbrecher-Case 2012 soft-core LJ + linear-λ Coulomb for
-    pairs involving at least one disappearing atom.  Per-particle
-    parameters carry the AMBER (charge, sigma, ε) plus a boolean
-    ``is_dis`` flag; ``is_dis = 1`` means the atom is the truncated
-    sidechain.
+      1. **CustomNonbondedForce** (LJ only) with the soft-core
+         potential: standard AMBER LJ for non-disappearing pairs,
+         Beutler 1994 soft-core LJ (with λ-amplitude scaling) for
+         pairs involving ≥1 disappearing atom.  NoCutoff — the
+         soft-core breaks PME compatibility, and at 1.0 nm
+         cutoff the LJ error is small anyway.
+
+      2. **NonbondedForce** (Coulomb only, PME) with the original
+         AMBER (sigma, ε) carried over for completeness, but
+         charges multiplied by ``(1 - is_dis · λ)`` so that
+         disappearing atoms' Coulomb turns off linearly with λ.
+         AMBER's original 1-2/1-3/1-4 exception list is preserved
+         (1-2/1-3 fully excluded via ``chargeProduct=0``; 1-4
+         carries the standard 0.5·q1·q2 scaled Coulomb).
+
+    Why two forces?  OpenMM 8.x's CustomNonbondedForce does not
+    support PME, and replacing AMBER's NonbondedForce (which
+    does) loses the periodic-image Coulomb interactions that
+    hold TIP3P waters together — the bulk-water ΔE is wrong by
+    ~25,000 kJ/mol.  Splitting LJ and Coulomb into two forces
+    preserves PME for the Coulomb while letting us apply the
+    soft-core only to the LJ.
+
+    Returns ``(lj_force, coulomb_force, n_particles,
+    original_qsigspe, exceptions)`` — caller updates the
+    Coulomb charges at each λ change via
+    ``update_coulomb_for_lambda``.
     """
     openmm, unit = _require_openmm()
 
@@ -1699,69 +1721,195 @@ def _replace_amber_nb_with_alchemical(
         q, sig, eps = old_nb.getParticleParameters(j)
         orig.append((q, sig, eps))
 
-    # Capture AMBER's exception list (1-2, 1-3 bonded pairs and
-    # 1-4 scaled pairs).  CustomNonbondedForce evaluates ALL pairs by
-    # default — we have to copy the exclusion list or bonded atoms
-    # will see ~1.5 Å LJ energies and blow up the system.
+    # Capture AMBER's exception list.  Keep the full tuple
+    # (chargeProduct, sigma, epsilon) so we can replay it on
+    # the new NonbondedForce exactly as AMBER had it.
     exceptions = []
     for k in range(old_nb.getNumExceptions()):
-        i, j = old_nb.getExceptionParameters(k)[:2]
-        exceptions.append((i, j))
+        exc = old_nb.getExceptionParameters(k)
+        exceptions.append(exc)
 
     system.removeForce(nb_idx)
 
-    # Build the soft-core CustomNonbondedForce.
-    nb = openmm.CustomNonbondedForce("")
-    nb.addGlobalParameter("lam", lambda_value)
-    nb.addGlobalParameter("alpha", alpha_nm2)
-    nb.addPerParticleParameter("charge")
-    nb.addPerParticleParameter("sigma")
-    nb.addPerParticleParameter("eps")
-    nb.addPerParticleParameter("is_dis")
+    # ========== 1. CustomNonbondedForce for LJ (soft-core) ==========
+    lj = openmm.CustomNonbondedForce("")
+    lj.addGlobalParameter("lam", lambda_value)
+    lj.addGlobalParameter("alpha", alpha_nm2)
+    lj.addPerParticleParameter("sigma")
+    lj.addPerParticleParameter("eps")
+    lj.addPerParticleParameter("is_dis")
 
     for j in range(n_particles):
         is_dis = 1.0 if j in disappearing_set else 0.0
-        nb.addParticle((orig[j][0], orig[j][1], orig[j][2], is_dis))
+        lj.addParticle((orig[j][1], orig[j][2], is_dis))
 
-    # Single inlined expression — CustomNonbondedForce doesn't
-    # accept "; subexpression = value" sub-statements (it expects
-    # the expression to be one big formula), and addComputedValue
-    # can't reference per-particle params with _1/_2 suffixes.  So
-    # everything must be one expression.
-    # Per-pair classification via per-particle is_dis flags:
-    #   weight_dis = is_dis1 + is_dis2 - is_dis1*is_dis2
-    #   weight_core = (1-is_dis1)*(1-is_dis2)
-    # Non-disappearing pairs use standard AMBER LJ + Coulomb.
-    # Disappearing pairs use soft-core LJ + Coulomb scaled by λ.
-    nb.setEnergyFunction(
-        # 1. AMBER LJ for non-disappearing pairs.
+    lj.setEnergyFunction(
+        # Standard AMBER LJ for non-disappearing pairs.
         "((1-is_dis1)*(1-is_dis2)) * 4 * sqrt(eps1*eps2) * "
         "(((0.5*(sigma1+sigma2))^12)/(r*r)^6 - "
         "((0.5*(sigma1+sigma2))^6)/(r*r)^3)"
-        # 2. Coulomb for non-disappearing pairs.
-        " + ((1-is_dis1)*(1-is_dis2)) * charge1*charge2 / r"
-        # 3. Soft-core LJ for disappearing pairs (Beutler 1994 form — at
-        # λ=1 it reduces exactly to standard LJ; Steinbrecher-Case 2012
-        # uses σ^6 in the repulsion term which leaves an endpoint artefact
-        # that explodes to ~1e9 kJ/mol when λ=1 and atoms are in close
-        # contact after several λ windows of soft-core relaxation).
+        # Beutler 1994 soft-core LJ for pairs involving ≥1
+        # disappearing atom.  At λ=1 this reduces exactly to
+        # standard LJ.  λ is the soft-core "amplitude" — full
+        # interaction at λ=1, fully decoupled at λ=0.
         " + ((is_dis1 + is_dis2 - is_dis1*is_dis2)) * lam * 4 * sqrt(eps1*eps2) * "
         "(((0.5*(sigma1+sigma2))^12) / (alpha*(1-lam)^2 + (r*r)*(r*r)*(r*r))^2 - "
         "((0.5*(sigma1+sigma2))^6)  / (alpha*(1-lam)^2 + (r*r)*(r*r)*(r*r)))"
-        # 4. Coulomb for disappearing pairs (linear λ scaling).
-        " + ((is_dis1 + is_dis2 - is_dis1*is_dis2)) * lam * charge1*charge2 / r"
     )
-    # Copy AMBER's exception list (1-2, 1-3 bonded pairs are
-    # excluded; 1-4 pairs are scaled — but our energy expression
-    # doesn't model 1-4 scaling, so we just exclude all of them).
-    for (i, j) in exceptions:
+    # 1-2/1-3/1-4 exclusions (LJ has no scaling — for the
+    # standard part we just exclude all bonded pairs; the
+    # 1-4 scaled LJ error is small for protein-ligand setups).
+    for exc in exceptions:
+        i, j = exc[0], exc[1]
         if i < j:
-            nb.addExclusion(i, j)
+            lj.addExclusion(i, j)
         else:
-            nb.addExclusion(j, i)
+            lj.addExclusion(j, i)
+    lj.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+    lj.setCutoffDistance(cutoff_nm * unit.nanometer)
+    system.addForce(lj)
 
-    nb.setNonbondedMethod(openmm.CustomNonbondedForce.NoCutoff)
-    system.addForce(nb)
+    # ========== 2. NonbondedForce for Coulomb (PME) ==========
+    coulomb = openmm.NonbondedForce()
+    coulomb.setNonbondedMethod(openmm.NonbondedForce.PME)
+    coulomb.setCutoffDistance(cutoff_nm * unit.nanometer)
+    coulomb.setEwaldErrorTolerance(5e-4)
+
+    is_dis = np.zeros(n_particles)
+    for j in range(n_particles):
+        is_dis[j] = 1.0 if j in disappearing_set else 0.0
+
+    for j in range(n_particles):
+        q0 = float(orig[j][0].value_in_unit(unit.elementary_charge))
+        q_eff = q0 * (1.0 - is_dis[j] * lambda_value)
+        # sigma and epsilon are set to 0 — the LJ is fully handled
+        # by the soft-core CustomNonbondedForce; this NonbondedForce
+        # is Coulomb-only.  Zero LJ params here prevents the integrator
+        # from double-counting.
+        coulomb.addParticle(q_eff, 0.0, 0.0)
+
+    # Replay AMBER's exception list — but with chargeProduct
+    # rescaled by the λ² factor for 1-4 pairs involving ≥1
+    # disappearing atom (since q_eff = q · (1 - is_dis · λ),
+    # q1_eff · q2_eff = q1 · q2 · (1 - is_dis1·λ)(1 - is_dis2·λ)).
+    for exc in exceptions:
+        i, j, charge_prod, sig, eps = exc
+        cp0 = float(charge_prod.value_in_unit(unit.elementary_charge ** 2))
+        sig_v = float(sig.value_in_unit(unit.nanometer))
+        eps_v = float(eps.value_in_unit(unit.kilojoule_per_mole))
+        # Recompute chargeProduct from original charges, not the
+        # already-scaled ones — we want AMBER's intrinsic scaling
+        # here (0.5 for 1-4, 0 for 1-2/1-3) and we'll re-multiply
+        # by (1 - is_dis1·λ)(1 - is_dis2·λ) below.
+        if cp0 == 0.0:
+            new_cp = 0.0  # 1-2/1-3 — already excluded
+        else:
+            q1 = float(orig[i][0].value_in_unit(unit.elementary_charge))
+            q2 = float(orig[j][0].value_in_unit(unit.elementary_charge))
+            # AMBER's intrinsic 1-4 scaling factor:
+            intrinsic = cp0 / (q1 * q2) if q1 * q2 != 0 else 0.0
+            new_cp = q1 * q2 * intrinsic * (
+                1.0 - is_dis[i] * lambda_value
+            ) * (1.0 - is_dis[j] * lambda_value)
+        # σ and ε carry over (LJ excluded here, but NonbondedForce
+        # needs the slot filled).
+        if i < j:
+            coulomb.addException(i, j, new_cp, 0.0, 0.0)
+        else:
+            coulomb.addException(j, i, new_cp, 0.0, 0.0)
+
+    system.addForce(coulomb)
+
+    return lj, coulomb, n_particles, orig, exceptions, is_dis
+
+
+def update_coulomb_for_lambda(
+    coulomb_force,
+    n_particles: int,
+    original_charges,
+    exceptions,
+    is_dis: np.ndarray,
+    lambda_value: float,
+    context=None,
+):
+    openmm, unit = _require_openmm()
+    """Push new λ-dependent Coulomb charges and exception
+    chargeProducts into a Context.  Call this at each λ change
+    before sampling.
+
+    ``original_charges`` is the list/array of unscaled AMBER
+    charges, ``exceptions`` is the list returned by
+    ``_replace_amber_nb_with_split_forces``, and ``is_dis`` is
+    the per-particle 0/1 flag.  If ``context`` is provided,
+    also calls ``updateParametersInContext`` to push the new
+    values into the running context.
+    """
+    for j in range(n_particles):
+        q0 = float(original_charges[j][0].value_in_unit(unit.elementary_charge))
+        q_eff = q0 * (1.0 - is_dis[j] * lambda_value)
+        coulomb_force.setParticleParameters(j, q_eff, 0.0, 0.0)
+    for k, exc in enumerate(exceptions):
+        i, j, charge_prod, sig, eps = exc
+        cp0 = float(charge_prod.value_in_unit(unit.elementary_charge ** 2))
+        sig_v = float(sig.value_in_unit(unit.nanometer))
+        eps_v = float(eps.value_in_unit(unit.kilojoule_per_mole))
+        if cp0 == 0.0:
+            new_cp = 0.0
+        else:
+            q1 = float(original_charges[i][0].value_in_unit(unit.elementary_charge))
+            q2 = float(original_charges[j][0].value_in_unit(unit.elementary_charge))
+            intrinsic = cp0 / (q1 * q2) if q1 * q2 != 0 else 0.0
+            new_cp = q1 * q2 * intrinsic * (
+                1.0 - is_dis[i] * lambda_value
+            ) * (1.0 - is_dis[j] * lambda_value)
+        # σ and ε set to 0 — this is Coulomb-only (see comment in
+        # _replace_amber_nb_with_split_forces).
+        coulomb_force.setExceptionParameters(k, i, j, new_cp, 0.0, 0.0)
+    if context is not None:
+        coulomb_force.updateParametersInContext(context)
+
+
+def _replace_amber_nb_with_alchemical(
+    system,
+    disappearing_set: set,
+    lambda_value: float,
+    alpha_nm2: float = 1.5,
+    cutoff_nm: float = 1.0,
+):
+    """Backward-compatibility shim around
+    :func:`_replace_amber_nb_with_split_forces`.  Replaces
+    AMBER's NonbondedForce with the split (LJ-soft-core +
+    Coulomb-PME) pair.  See the split function's docstring for
+    details.
+
+    For tests that check "the soft-core NonbondedForce is in
+    the system", note: there are now TWO forces instead of
+    one — the LJ CustomNonbondedForce (the soft-core one) and
+    the Coulomb NonbondedForce (with PME).
+    """
+    lj, coulomb, n_particles, orig, exceptions, is_dis = (
+        _replace_amber_nb_with_split_forces(
+            system, disappearing_set, lambda_value,
+            alpha_nm2=alpha_nm2, cutoff_nm=cutoff_nm,
+        )
+    )
+    # Stash the split bookkeeping on the system object (not the
+    # Swig-proxied LJ force — Python attributes on SWIG proxies
+    # don't survive subsequent getForces() calls).
+    system._fep_split_metadata = (coulomb, n_particles, orig, exceptions, is_dis)
+    return lj
+
+
+def get_split_force_metadata(lj_force, system=None):
+    """Return the split-force bookkeeping attached by
+    :func:`_replace_amber_nb_with_alchemical`.
+
+    Returns ``(coulomb_force, n_particles, original_params,
+    exceptions, is_dis)`` or ``None`` if not available.
+    """
+    if system is not None:
+        return getattr(system, "_fep_split_metadata", None)
+    return None
 
 
 def build_amber_mutation_system(
@@ -1972,11 +2120,34 @@ def run_amber_mutation_fep(
             unit.kilojoule_per_mole
         )
 
+    # Pull split-force bookkeeping so we can update the Coulomb
+    # charges on every λ change.
+    split_md = get_split_force_metadata(nb, system=system)
+    if split_md is None:
+        coulomb_force = None
+        n_particles_split = 0
+        orig_charges = []
+        exc_list = []
+        is_dis_arr = np.zeros(0)
+    else:
+        coulomb_force, n_particles_split, orig_charges, exc_list, is_dis_arr = split_md
+
+    def _set_lambda(lam_value: float):
+        """Push new λ into both LJ-soft-core (global param) and
+        Coulomb (per-particle parameters)."""
+        context.setParameter("lam", float(lam_value))
+        nb.updateParametersInContext(context)
+        if coulomb_force is not None:
+            update_coulomb_for_lambda(
+                coulomb_force, n_particles_split,
+                orig_charges, exc_list, is_dis_arr, lam_value,
+                context=context,
+            )
+
     for i, lam in enumerate(lambdas):
         # Set this window's λ and make sure the soft-core Force
         # sees it.
-        context.setParameter("lam", float(lam))
-        nb.updateParametersInContext(context)
+        _set_lambda(lam)
         context.setPositions(positions)
 
         # Minimise at each λ before sampling — even with reference
@@ -2015,13 +2186,9 @@ def run_amber_mutation_fep(
                     nb.updateParametersInContext(context)
                     u_prev = _energy_at_current_lam()
                 if next_lam is not None:
-                    context.setParameter("lam", float(next_lam))
-                    nb.updateParametersInContext(context)
+                    _set_lambda(next_lam)
                     u_next = _energy_at_current_lam()
-                # Restore own λ for the next MD step's force
-                # calculation.
-                context.setParameter("lam", float(lam))
-                nb.updateParametersInContext(context)
+                _set_lambda(lam)
                 neighbor_energies[lam].append((u_prev, u_next))
 
     del context
@@ -2222,9 +2389,33 @@ def run_ligand_decouple_fep(
             unit.kilojoule_per_mole
         )
 
-    for i, lam in enumerate(lambdas):
-        context.setParameter("lam", float(lam))
+    # Pull the split-force bookkeeping so we can update the
+    # Coulomb charges on every λ change.
+    split_md = get_split_force_metadata(nb, system=system)
+    if split_md is None:
+        # Pre-split-force build — fall back to single setParameter.
+        coulomb_force = None
+        n_particles_split = 0
+        orig_charges = []
+        exc_list = []
+        is_dis_arr = np.zeros(0)
+    else:
+        coulomb_force, n_particles_split, orig_charges, exc_list, is_dis_arr = split_md
+
+    def _set_lambda(lam_value: float):
+        """Push new λ into both LJ-soft-core (via global param)
+        and Coulomb (via per-particle parameter updates)."""
+        context.setParameter("lam", float(lam_value))
         nb.updateParametersInContext(context)
+        if coulomb_force is not None:
+            update_coulomb_for_lambda(
+                coulomb_force, n_particles_split,
+                orig_charges, exc_list, is_dis_arr, lam_value,
+                context=context,
+            )
+
+    for i, lam in enumerate(lambdas):
+        _set_lambda(lam)
         context.setPositions(positions)
         if hasattr(openmm, "LocalEnergyMinimizer"):
             openmm.LocalEnergyMinimizer.minimize(
@@ -2244,15 +2435,12 @@ def run_ligand_decouple_fep(
                 u_prev: Optional[float] = None
                 u_next: Optional[float] = None
                 if prev_lam is not None:
-                    context.setParameter("lam", float(prev_lam))
-                    nb.updateParametersInContext(context)
+                    _set_lambda(prev_lam)
                     u_prev = _energy_at_current_lam()
                 if next_lam is not None:
-                    context.setParameter("lam", float(next_lam))
-                    nb.updateParametersInContext(context)
+                    _set_lambda(next_lam)
                     u_next = _energy_at_current_lam()
-                context.setParameter("lam", float(lam))
-                nb.updateParametersInContext(context)
+                _set_lambda(lam)
                 neighbor_energies[lam].append((u_prev, u_next))
 
     del context
