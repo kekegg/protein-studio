@@ -46,12 +46,15 @@ from ..core.fep_mcp import (
 # ---------------------------------------------------------------------------
 
 class FEPRunWorker(QObject):
-    """Runs ``fep_run_sweep`` in a worker thread.
+    """Runs ``fep_run_sweep_with_checkpoint`` in a worker thread.
 
     Emits ``progress(dict)`` periodically and ``finished(dict)`` /
-    ``failed(str)`` when done. The worker holds the QThread alive
-    via its lifetime; cancellation is a no-op for now (long runs
-    will need a flag-based abort path in a future revision).
+    ``failed(str)`` when done. Cancellation flips ``self._cancel``
+    to True; the underlying sweep's ``cancellation_check`` sees it
+    and raises ``FEPInterrupted`` after the current window finishes,
+    which the wrapper catches and surfaces as
+    ``status="interrupted"`` (along with the preserved partial
+    energies in the checkpoint file).
     """
 
     progress = Signal(dict)
@@ -65,6 +68,8 @@ class FEPRunWorker(QObject):
         recipe_name: str,
         mutation: Optional[str],
         ligand_resname: Optional[str],
+        checkpoint_path: Optional[str] = None,
+        resume_from: Optional[str] = None,
     ):
         super().__init__()
         self._pdb_path = pdb_path
@@ -72,6 +77,17 @@ class FEPRunWorker(QObject):
         self._recipe_name = recipe_name
         self._mutation = mutation
         self._ligand_resname = ligand_resname
+        self._checkpoint_path = checkpoint_path
+        self._resume_from = resume_from
+        # Atomic flag the GUI can flip from the main thread.
+        from threading import Event
+        self._cancel = Event()
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+
+    def _cancelled(self) -> bool:
+        return self._cancel.is_set()
 
     def run(self) -> None:
         try:
@@ -79,41 +95,39 @@ class FEPRunWorker(QObject):
             self.progress.emit({
                 "stage": "starting",
                 "message": (
-                    f"Running {self._mode} FEP on "
-                    f"{self._pdb_path} with recipe '{self._recipe_name}' "
+                    f"{'Resume' if self._resume_from else 'Run'} "
+                    f"{self._mode} FEP on {self._pdb_path} "
+                    f"with recipe '{self._recipe_name}' "
                     f"({recipe['n_lambdas']} λ × "
                     f"{recipe['n_equilibration_steps'] + recipe['n_production_steps']} steps)"
                 ),
             })
 
-            def cb(lambda_idx, n_lambdas, lam_value, n_samples):
-                    # Coarse-grained progress: 5% reserved for build,
-                    # 90% split across λ windows, 5% reserved for
-                    # BAR analysis.
-                    self.progress.emit({
-                        "stage": "window",
-                        "lambda_idx": lambda_idx,
-                        "n_lambdas": n_lambdas,
-                        "lam_value": lam_value,
-                        "n_samples": n_samples,
-                    })
+            def cb(progress_dict):
+                self.progress.emit(progress_dict)
 
-            result = fep_run_sweep(
-                pdb_path=self._pdb_path,
-                mode=self._mode,
-                recipe_name=self._recipe_name,
-                mutation=self._mutation,
-                ligand_resname=self._ligand_resname,
-                progress_callback=cb,
-            )
-            if result.get("status") == "ok":
-                self.finished.emit(result)
-            else:
-                self.failed.emit(
-                    result.get("error", "Unknown error")
-                    + "\n"
-                    + result.get("traceback", "")
+            # Use the checkpointed variant — supports cancellation and
+            # resume. ``resume_from`` paths go through fep_resume_sweep,
+            # which reads the existing checkpoint and only runs the
+            # remaining windows.
+            if self._resume_from:
+                from ..core.fep_mcp import fep_resume_sweep
+                result = fep_resume_sweep(
+                    checkpoint_path=self._resume_from,
+                    cancellation_check=self._cancelled,
                 )
+            else:
+                from ..core.fep_mcp import fep_run_sweep_with_checkpoint
+                result = fep_run_sweep_with_checkpoint(
+                    pdb_path=self._pdb_path,
+                    mode=self._mode,
+                    recipe_name=self._recipe_name,
+                    mutation=self._mutation,
+                    ligand_resname=self._ligand_resname,
+                    checkpoint_path=self._checkpoint_path,
+                    cancellation_check=self._cancelled,
+                )
+            self.finished.emit(result)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
@@ -206,19 +220,46 @@ class FEPPanel(QWidget):
         btn_row = QHBoxLayout()
         self._run_btn = QPushButton("Run sweep")
         self._run_btn.clicked.connect(self._on_run)
+        self._resume_btn = QPushButton("Resume checkpoint…")
+        self._resume_btn.clicked.connect(self._on_resume)
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._cancel_btn.setEnabled(False)
         btn_row.addWidget(self._run_btn)
+        btn_row.addWidget(self._resume_btn)
         btn_row.addWidget(self._cancel_btn)
         run_layout.addLayout(btn_row)
+
+        # Checkpoint path row (optional override).
+        cp_row = QHBoxLayout()
+        self._cp_edit = QLineEdit()
+        self._cp_edit.setPlaceholderText(
+            "(default — derived from sweep inputs)"
+        )
+        cp_browse = QPushButton("…")
+        cp_browse.clicked.connect(self._on_cp_browse)
+        cp_row.addWidget(QLabel("Checkpoint:"))
+        cp_row.addWidget(self._cp_edit)
+        cp_row.addWidget(cp_browse)
+        run_layout.addLayout(cp_row)
 
         self._run_result = QPlainTextEdit()
         self._run_result.setReadOnly(True)
         run_layout.addWidget(self._run_result)
 
+        self._open_analyze_btn = QPushButton("Open in Analyze tab →")
+        self._open_analyze_btn.clicked.connect(self._on_open_analyze)
+        self._open_analyze_btn.setEnabled(False)
+        run_layout.addWidget(self._open_analyze_btn)
+
+        # Analyze tab.
+        from .fep_analyze import FEPAnalyzeWidget
+        self._analyze_widget = FEPAnalyzeWidget()
+
         tabs.addTab(setup, "Setup")
         tabs.addTab(run, "Run")
+        tabs.addTab(self._analyze_widget, "Analyze")
+        self._tabs = tabs
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
@@ -308,6 +349,7 @@ class FEPPanel(QWidget):
         self._run_result.clear()
         self._run_status.setText("Starting…")
 
+        cp_path = self._cp_edit.text().strip() or None
         self._thread = QThread()
         self._worker = FEPRunWorker(
             pdb_path=path,
@@ -315,6 +357,7 @@ class FEPPanel(QWidget):
             recipe_name=self._recipe_combo.currentText(),
             mutation=mutation,
             ligand_resname=ligand,
+            checkpoint_path=cp_path,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -325,6 +368,49 @@ class FEPPanel(QWidget):
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+
+    def _on_resume(self) -> None:
+        """Pick a checkpoint file and continue a previously-cancelled sweep."""
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Pick checkpoint file", "",
+            "FEP checkpoints (*.fepcp);;All files (*)"
+        )
+        if not path:
+            return
+        self._cp_edit.setText(path)
+        self._run_status.setText(f"Resuming from {path}…")
+        self._run_btn.setEnabled(False)
+        self._resume_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
+        self._progress.setValue(0)
+
+        self._thread = QThread()
+        self._worker = FEPRunWorker(
+            pdb_path="",  # unused when resuming
+            mode="",
+            recipe_name="quick_test",
+            mutation=None,
+            ligand_resname=None,
+            resume_from=path,
+        )
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _on_cp_browse(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Pick checkpoint file", "",
+            "FEP checkpoints (*.fepcp);;All files (*)"
+        )
+        if path:
+            self._cp_edit.setText(path)
 
     def _on_progress(self, info: dict) -> None:
         stage = info.get("stage")
@@ -344,32 +430,68 @@ class FEPPanel(QWidget):
 
     def _on_finished(self, result: dict) -> None:
         self._run_btn.setEnabled(True)
+        self._resume_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
-        self._progress.setValue(100)
-        dg = result.get("delta_g_kJmol", 0.0)
-        sig = result.get("sigma_kJmol", 0.0)
-        self._run_status.setText(
-            f"✓ ΔG_FEP = {dg:.3f} ± {sig:.3f} kJ/mol "
-            f"({result['delta_g_kcal_mol']:.3f} ± {sig/4.184:.3f} kcal/mol)"
-        )
         import json
-        self._run_result.setPlainText(json.dumps(result, indent=2))
+        self._last_result = result
+
+        status = result.get("status", "error")
+        if status == "ok":
+            self._progress.setValue(100)
+            dg = result.get("delta_g_kJmol", 0.0)
+            sig = result.get("sigma_kJmol", 0.0)
+            tag = " (resumed)" if result.get("resumed_from_checkpoint") else ""
+            self._run_status.setText(
+                f"✓ ΔG_FEP = {dg:.3f} ± {sig:.3f} kJ/mol{tag} "
+                f"({result['delta_g_kcal_mol']:.3f} ± {sig/4.184:.3f} kcal/mol)"
+            )
+            self._run_result.setPlainText(json.dumps(result, indent=2))
+            self._open_analyze_btn.setEnabled(True)
+        elif status == "interrupted":
+            n_done = result.get("n_completed", 0)
+            n_total = len(result.get("completed_lambdas", [])) + len(
+                result.get("remaining_lambdas", [])
+            )
+            cp = result.get("checkpoint_path", "?")
+            self._progress.setValue(int(100 * n_done / max(n_total, 1)))
+            self._run_status.setText(
+                f"⏸ Cancelled at λ window {n_done}/{n_total}. "
+                f"Checkpoint: {cp}"
+            )
+            self._run_result.setPlainText(json.dumps(result, indent=2))
+        else:  # error
+            self._progress.setValue(0)
+            self._run_status.setText(f"✗ {status}")
+            self._run_result.setPlainText(json.dumps(result, indent=2))
+
+    def _on_open_analyze(self) -> None:
+        """Switch to the Analyze tab and load the most recent result."""
+        if getattr(self, "_last_result", None) is None:
+            return
+        self._analyze_widget.set_result(self._last_result)
+        # Switch the visible tab to the Analyze index.
+        self._tabs.setCurrentIndex(self._tabs.indexOf(self._analyze_widget))
 
     def _on_failed(self, error: str) -> None:
         self._run_btn.setEnabled(True)
+        self._resume_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._progress.setValue(0)
         self._run_status.setText("✗ Failed.")
         self._run_result.setPlainText(error)
 
     def _on_cancel(self) -> None:
-        # Best-effort: tear down the worker thread. Cancellation of an
-        # in-flight OpenMM integration loop requires a flag the runner
-        # checks — out of scope for this minimum-runnable revision.
-        if self._thread is not None and self._thread.isRunning():
-            self._thread.requestInterruption()
-            self._thread.quit()
-            self._run_status.setText("Cancel requested.")
+        # Flip the worker's atomic cancel flag. The sweep's
+        # cancellation_check sees it after the current λ window
+        # finishes and raises FEPInterrupted; the wrapper catches
+        # that and writes a final checkpoint with status="interrupted".
+        if self._worker is None:
+            return
+        self._worker.request_cancel()
+        self._run_status.setText(
+            "Cancelling — finishing current window then writing checkpoint…"
+        )
+        self._cancel_btn.setEnabled(False)
 
 
 # ---------------------------------------------------------------------------

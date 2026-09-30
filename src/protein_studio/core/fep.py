@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -100,6 +100,14 @@ class FEPResult:
     sem_energies: List[float] = field(default_factory=list)
     delta_g: float = 0.0
     delta_g_sem: float = 0.0
+
+
+class FEPInterrupted(Exception):
+    """Raised when a long-running sweep is cancelled between windows.
+
+    Carries the count of completed windows so the checkpoint layer
+    can resume from the right place.
+    """
 
 
 def _require_openmm():
@@ -2017,6 +2025,8 @@ def run_amber_mutation_fep(
     restraint_k_kJmol_nm2: Optional[float] = None,
     sample_every: int = 1,
     sample_neighbor_lambdas: bool = False,
+    cancellation_check: Optional[Callable[[], bool]] = None,
+    window_callback: Optional[Callable[[Dict[float, List[float]], Dict[float, List[Any]], List[float]], None]] = None,
 ):
     """Production-grade FEP for a sidechain-truncation mutation.
 
@@ -2161,6 +2171,14 @@ def run_amber_mutation_fep(
             )
 
     for i, lam in enumerate(lambdas):
+        # Cancellation check between windows — cheap, runs before
+        # any expensive work (minimise / equilibrate).
+        if cancellation_check is not None and cancellation_check():
+            raise FEPInterrupted(
+                f"Cancelled before λ = {lam:.3f} "
+                f"(completed {i} / {n_windows} windows)"
+            )
+
         # Set this window's λ and make sure the soft-core Force
         # sees it.
         _set_lambda(lam)
@@ -2206,6 +2224,16 @@ def run_amber_mutation_fep(
                     u_next = _energy_at_current_lam()
                 _set_lambda(lam)
                 neighbor_energies[lam].append((u_prev, u_next))
+
+        # Notify checkpoint / progress layer after each window
+        # finishes. Cheap — runs once per λ, after all production
+        # sampling is done.
+        if window_callback is not None:
+            window_callback(
+                {l: list(energies_by_lambda[l]) for l in lambdas},
+                {l: list(neighbor_energies[l]) for l in lambdas},
+                list(lambdas[: i + 1]),
+            )
 
     del context
 
@@ -2338,6 +2366,8 @@ def run_ligand_decouple_fep(
     sample_every: int = 1,
     sample_neighbor_lambdas: bool = False,
     boresch_kwargs: Optional[dict] = None,
+    cancellation_check: Optional[Callable[[], bool]] = None,
+    window_callback: Optional[Callable[[Dict[float, List[float]], Dict[float, List[Any]], List[float]], None]] = None,
 ):
     """Run FEP for ligand decoupling — both the complex and
     solution sides of a double-decoupling binding free energy.
@@ -2431,6 +2461,11 @@ def run_ligand_decouple_fep(
             )
 
     for i, lam in enumerate(lambdas):
+        if cancellation_check is not None and cancellation_check():
+            raise FEPInterrupted(
+                f"Cancelled before λ = {lam:.3f} "
+                f"(completed {i} / {len(lambdas)} windows)"
+            )
         _set_lambda(lam)
         context.setPositions(positions)
         if hasattr(openmm, "LocalEnergyMinimizer"):
@@ -2458,6 +2493,14 @@ def run_ligand_decouple_fep(
                     u_next = _energy_at_current_lam()
                 _set_lambda(lam)
                 neighbor_energies[lam].append((u_prev, u_next))
+
+        # Notify checkpoint / progress layer after each window.
+        if window_callback is not None:
+            window_callback(
+                {l: list(energies_by_lambda[l]) for l in lambdas},
+                {l: list(neighbor_energies[l]) for l in lambdas},
+                list(lambdas[: i + 1]),
+            )
 
     del context
 

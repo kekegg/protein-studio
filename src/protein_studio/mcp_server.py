@@ -233,6 +233,38 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
          "mutation": {"type": "string"},
          "ligand_resname": {"type": "string"},
      }, "required": ["pdb_path", "mode"], "additionalProperties": False}},
+    {"name": "fep_run_sweep_with_checkpoint", "description": (
+        "Same as fep_run_sweep but writes a pickle checkpoint after "
+        "every λ window. Pass checkpoint_path to override the default "
+        "(derived from the sweep inputs). On cancellation the partial "
+        "state is preserved — call fep_resume_sweep with the same "
+        "checkpoint_path to continue."),
+     "inputSchema": {"type": "object", "properties": {
+         "pdb_path": {"type": "string"},
+         "mode": {"type": "string", "enum": ["mutation", "ligand_decouple"]},
+         "recipe_name": {"type": "string", "default": "quick_test"},
+         "mutation": {"type": "string"},
+         "ligand_resname": {"type": "string"},
+         "checkpoint_path": {"type": "string"},
+     }, "required": ["pdb_path", "mode"], "additionalProperties": False}},
+    {"name": "fep_resume_sweep", "description": (
+        "Resume a sweep from an existing checkpoint file. Skips the "
+        "already-completed λ windows and runs only the remainder. "
+        "Returns the same shape as fep_run_sweep on completion."),
+     "inputSchema": {"type": "object", "properties": {
+         "checkpoint_path": {"type": "string"},
+     }, "required": ["checkpoint_path"], "additionalProperties": False}},
+    {"name": "fep_checkpoint_info", "description": (
+        "Inspect a checkpoint file without loading OpenMM. Returns "
+        "missing / corrupt / ok status with progress info."),
+     "inputSchema": {"type": "object", "properties": {
+         "checkpoint_path": {"type": "string"},
+     }, "required": ["checkpoint_path"], "additionalProperties": False}},
+    {"name": "fep_checkpoint_delete", "description": (
+        "Delete a checkpoint file. Returns whether it existed."),
+     "inputSchema": {"type": "object", "properties": {
+         "checkpoint_path": {"type": "string"},
+     }, "required": ["checkpoint_path"], "additionalProperties": False}},
 ]
 
 
@@ -444,6 +476,29 @@ def _dispatch(name: str, arguments: Dict[str, Any],
         if "ligand_resname" in arguments:
             kwargs["ligand_resname"] = arguments["ligand_resname"]
         return _fep_run(arguments["pdb_path"], arguments["mode"], **kwargs)
+    if name == "fep_run_sweep_with_checkpoint":
+        from .core.fep_mcp import (
+            fep_run_sweep_with_checkpoint as _fep_run_cp,
+        )
+        kwargs = {"recipe_name": arguments.get("recipe_name", "quick_test")}
+        if "mutation" in arguments:
+            kwargs["mutation"] = arguments["mutation"]
+        if "ligand_resname" in arguments:
+            kwargs["ligand_resname"] = arguments["ligand_resname"]
+        if "checkpoint_path" in arguments:
+            kwargs["checkpoint_path"] = arguments["checkpoint_path"]
+        return _fep_run_cp(
+            arguments["pdb_path"], arguments["mode"], **kwargs,
+        )
+    if name == "fep_resume_sweep":
+        from .core.fep_mcp import fep_resume_sweep as _fep_resume
+        return _fep_resume(arguments["checkpoint_path"])
+    if name == "fep_checkpoint_info":
+        from .core.fep_mcp import fep_checkpoint_info as _fep_info
+        return _fep_info(arguments["checkpoint_path"])
+    if name == "fep_checkpoint_delete":
+        from .core.fep_mcp import fep_checkpoint_delete as _fep_del
+        return _fep_del(arguments["checkpoint_path"])
     raise ValueError(f"unknown tool: {name}")
 
 
