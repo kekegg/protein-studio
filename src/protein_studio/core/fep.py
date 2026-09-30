@@ -1756,20 +1756,31 @@ def _replace_amber_nb_with_split_forces(
         "(((0.5*(sigma1+sigma2))^12) / (alpha*(1-lam)^2 + (r*r)*(r*r)*(r*r))^2 - "
         "((0.5*(sigma1+sigma2))^6)  / (alpha*(1-lam)^2 + (r*r)*(r*r)*(r*r)))"
     )
-    # 1-2/1-3/1-4 exclusions (LJ has no scaling — for the
-    # standard part we just exclude all bonded pairs; the
-    # 1-4 scaled LJ error is small for protein-ligand setups).
+    # 1-2/1-3 exclusions only (1-4 pairs are handled by the
+    # Coulomb NonbondedForce below, which carries AMBER's 1-4
+    # LJ params on its exception list — this avoids the ~3,000
+    # kJ/mol artefact we saw when 1-4 LJ was excluded entirely).
+    # AMBER's exception list uses chargeProduct=0 to flag 1-2/1-3
+    # (excluded) and a non-zero chargeProduct for 1-4 (scaled).
     for exc in exceptions:
-        i, j = exc[0], exc[1]
-        if i < j:
-            lj.addExclusion(i, j)
-        else:
-            lj.addExclusion(j, i)
+        i, j, charge_prod = exc[0], exc[1], exc[2]
+        cp0 = float(charge_prod.value_in_unit(unit.elementary_charge ** 2))
+        if cp0 == 0.0:
+            # 1-2 or 1-3: fully excluded from LJ.
+            if i < j:
+                lj.addExclusion(i, j)
+            else:
+                lj.addExclusion(j, i)
+        # else: 1-4 — let the Coulomb NonbondedForce handle it.
     lj.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
     lj.setCutoffDistance(cutoff_nm * unit.nanometer)
     system.addForce(lj)
 
     # ========== 2. NonbondedForce for Coulomb (PME) ==========
+    # Also carries AMBER's 1-4 scaled LJ via the exception
+    # list (sigma, epsilon set to AMBER's 1-4 values for those
+    # pairs).  1-2/1-3 exceptions have sigma=epsilon=0 (excluded
+    # from both LJ and Coulomb here).
     coulomb = openmm.NonbondedForce()
     coulomb.setNonbondedMethod(openmm.NonbondedForce.PME)
     coulomb.setCutoffDistance(cutoff_nm * unit.nanometer)
@@ -1782,10 +1793,9 @@ def _replace_amber_nb_with_split_forces(
     for j in range(n_particles):
         q0 = float(orig[j][0].value_in_unit(unit.elementary_charge))
         q_eff = q0 * (1.0 - is_dis[j] * lambda_value)
-        # sigma and epsilon are set to 0 — the LJ is fully handled
-        # by the soft-core CustomNonbondedForce; this NonbondedForce
-        # is Coulomb-only.  Zero LJ params here prevents the integrator
-        # from double-counting.
+        # Particles that are *not* in any 1-4 exception have
+        # sigma=epsilon=0 in this force (so no LJ contribution),
+        # since the LJ soft-core handles them.
         coulomb.addParticle(q_eff, 0.0, 0.0)
 
     # Replay AMBER's exception list — but with chargeProduct
@@ -1802,21 +1812,25 @@ def _replace_amber_nb_with_split_forces(
         # here (0.5 for 1-4, 0 for 1-2/1-3) and we'll re-multiply
         # by (1 - is_dis1·λ)(1 - is_dis2·λ) below.
         if cp0 == 0.0:
-            new_cp = 0.0  # 1-2/1-3 — already excluded
+            # 1-2/1-3: fully excluded from both LJ and Coulomb here.
+            new_cp = 0.0
+            new_sig = 0.0
+            new_eps = 0.0
         else:
+            # 1-4: rescale chargeProduct for disappearing atoms,
+            # keep AMBER's sigma/epsilon for the LJ contribution.
             q1 = float(orig[i][0].value_in_unit(unit.elementary_charge))
             q2 = float(orig[j][0].value_in_unit(unit.elementary_charge))
-            # AMBER's intrinsic 1-4 scaling factor:
             intrinsic = cp0 / (q1 * q2) if q1 * q2 != 0 else 0.0
             new_cp = q1 * q2 * intrinsic * (
                 1.0 - is_dis[i] * lambda_value
             ) * (1.0 - is_dis[j] * lambda_value)
-        # σ and ε carry over (LJ excluded here, but NonbondedForce
-        # needs the slot filled).
+            new_sig = sig_v
+            new_eps = eps_v
         if i < j:
-            coulomb.addException(i, j, new_cp, 0.0, 0.0)
+            coulomb.addException(i, j, new_cp, new_sig, new_eps)
         else:
-            coulomb.addException(j, i, new_cp, 0.0, 0.0)
+            coulomb.addException(j, i, new_cp, new_sig, new_eps)
 
     system.addForce(coulomb)
 
@@ -1855,6 +1869,8 @@ def update_coulomb_for_lambda(
         eps_v = float(eps.value_in_unit(unit.kilojoule_per_mole))
         if cp0 == 0.0:
             new_cp = 0.0
+            new_sig = 0.0
+            new_eps = 0.0
         else:
             q1 = float(original_charges[i][0].value_in_unit(unit.elementary_charge))
             q2 = float(original_charges[j][0].value_in_unit(unit.elementary_charge))
@@ -1862,9 +1878,9 @@ def update_coulomb_for_lambda(
             new_cp = q1 * q2 * intrinsic * (
                 1.0 - is_dis[i] * lambda_value
             ) * (1.0 - is_dis[j] * lambda_value)
-        # σ and ε set to 0 — this is Coulomb-only (see comment in
-        # _replace_amber_nb_with_split_forces).
-        coulomb_force.setExceptionParameters(k, i, j, new_cp, 0.0, 0.0)
+            new_sig = sig_v
+            new_eps = eps_v
+        coulomb_force.setExceptionParameters(k, i, j, new_cp, new_sig, new_eps)
     if context is not None:
         coulomb_force.updateParametersInContext(context)
 
