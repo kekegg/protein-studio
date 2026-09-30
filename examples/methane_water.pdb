@@ -1,0 +1,15 @@
+HEADER    METHANE IN WATER (FEP SOLVATION BENCHMARK)
+REMARK    Single methane molecule in TIP3P water box.
+REMARK    Used to validate protein-studio/core/fep.py Phase 5
+REMARK    framework.  Expected ΔG_hydration ≈ +2.0 kcal/mol
+REMARK    (Shirts & Ponder, J Phys Chem B 2000).
+CRYST1   30.000   30.000   30.000  90.00  90.00  90.00 P 1           1
+MODEL        1
+ATOM      1  C   MTH A   1       0.000   0.000   0.000  1.00  0.00           C  
+ATOM      2  H1  MTH A   1       0.629   0.629   0.629  1.00  0.00           H  
+ATOM      3  H2  MTH A   1      -0.629  -0.629   0.629  1.00  0.00           H  
+ATOM      4  H3  MTH A   1       0.629  -0.629  -0.629  1.00  0.00           H  
+ATOM      5  H4  MTH A   1      -0.629   0.629  -0.629  1.00  0.00           H  
+TER      6      MTH A   1
+ENDMDL
+END
