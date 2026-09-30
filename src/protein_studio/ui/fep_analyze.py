@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -41,7 +42,12 @@ from PySide6.QtWidgets import (
 )
 
 from ..core import fep as fep_core
-from ..core.fep_mcp import ti_per_window
+from ..core.fep_mcp import (
+    ti_per_window,
+    fep_best_reference,
+    fep_compare_sweep_to_reference,
+    fep_list_references,
+)
 from .fep_plots import (
     BarChartWidget,
     ComparisonWidget,
@@ -56,6 +62,7 @@ class FEPAnalyzeWidget(QWidget):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._build_ui()
+        self._populate_reference_combo()
 
     # ------------------------------------------------------------------ UI
 
@@ -97,6 +104,33 @@ class FEPAnalyzeWidget(QWidget):
         cmp_layout.addWidget(self._cmp_chart)
         outer.addWidget(cmp_box)
 
+        # Reference benchmark comparison.
+        ref_box = QGroupBox("Compare to literature reference")
+        ref_layout = QVBoxLayout(ref_box)
+
+        ref_picker_row = QHBoxLayout()
+        ref_picker_row.addWidget(QLabel("Reference:"))
+        self._ref_combo = QComboBox()
+        self._ref_combo.setMinimumWidth(320)
+        ref_picker_row.addWidget(self._ref_combo)
+        self._ref_compare_btn = QPushButton("Compare")
+        self._ref_compare_btn.clicked.connect(self._on_compare_reference)
+        ref_picker_row.addWidget(self._ref_compare_btn)
+        ref_picker_row.addStretch(1)
+        ref_layout.addLayout(ref_picker_row)
+
+        self._ref_citation_label = QLabel("")
+        self._ref_citation_label.setWordWrap(True)
+        ref_layout.addWidget(self._ref_citation_label)
+
+        self._ref_result_label = QLabel(
+            "Pick a reference, then click Compare."
+        )
+        self._ref_result_label.setWordWrap(True)
+        self._ref_result_label.setTextFormat(Qt.TextFormat.RichText)
+        ref_layout.addWidget(self._ref_result_label)
+        outer.addWidget(ref_box)
+
         # Raw result (collapsible-style via QPlainTextEdit).
         outer.addWidget(QLabel("Raw result:"))
         self._raw = QPlainTextEdit()
@@ -105,6 +139,91 @@ class FEPAnalyzeWidget(QWidget):
         outer.addWidget(self._raw)
 
     # ------------------------------------------------------------------ data
+
+    def _populate_reference_combo(self) -> None:
+        """Fill the reference dropdown with the shipped catalog."""
+        refs = fep_list_references()["references"]
+        self._ref_combo.blockSignals(True)
+        self._ref_combo.clear()
+        self._ref_combo.addItem("(none — pick a reference)", userData=None)
+        for r in refs:
+            label = r["name"]
+            if not r.get("runnable", True):
+                label += "  ⚠ not runnable"
+            self._ref_combo.addItem(label, userData=r["name"])
+        self._ref_combo.blockSignals(False)
+        self._ref_combo.currentIndexChanged.connect(
+            self._on_reference_changed)
+
+    def _on_reference_changed(self, idx: int) -> None:
+        """Show the citation for the selected reference."""
+        name = self._ref_combo.itemData(idx)
+        if not name:
+            self._ref_citation_label.setText("")
+            return
+        refs = fep_list_references()["references"]
+        ref = next((r for r in refs if r["name"] == name), None)
+        if ref is None:
+            return
+        text = (
+            f"<b>{ref['description']}</b><br>"
+            f"<i>{ref['citation']}</i><br>"
+            f"Reference ΔG = {ref['reference_dG_kJmol']:+.2f} ± "
+            f"{ref['reference_dG_unc_kJmol']:.2f} kJ/mol "
+            f"({ref['reference_dG_kcal_mol']:+.2f} kcal/mol)"
+        )
+        if ref.get("pdb_file"):
+            text += f"<br>PDB: {ref['pdb_file']}"
+        if ref.get("notes"):
+            text += f"<br><span style='color:#9aa0a6'>{ref['notes']}</span>"
+        self._ref_citation_label.setText(text)
+
+    def _on_compare_reference(self) -> None:
+        """Compare the current sweep result against the picked reference."""
+        if self._current is None:
+            self._ref_result_label.setText(
+                "<span style='color:#dca85b'>⚠ Load a sweep result first.</span>"
+            )
+            return
+        idx = self._ref_combo.currentIndex()
+        name = self._ref_combo.itemData(idx)
+        if not name:
+            self._ref_result_label.setText(
+                "<span style='color:#dca85b'>⚠ Pick a reference.</span>"
+            )
+            return
+        cmp = fep_compare_sweep_to_reference(self._current, name)
+        if cmp.get("status") != "ok":
+            self._ref_result_label.setText(
+                f"<span style='color:#dca85b'>✗ {cmp.get('error')}</span>"
+            )
+            return
+        agreement = cmp["agreement"]
+        z = cmp["z_score"]
+        dev = cmp["deviation_kJmol"]
+        combined = cmp["combined_unc_kJmol"]
+        ref = cmp["reference"]
+        if agreement == "within_1sigma":
+            color = "#5b96e2"
+            icon = "✓"
+        elif agreement == "within_2sigma":
+            color = "#dca85b"
+            icon = "~"
+        else:
+            color = "#cc4040"
+            icon = "✗"
+        html = (
+            f"<span style='color:{color}'><b>{icon} "
+            f"{agreement.replace('_', ' ')}</b></span><br>"
+            f"z = {z:+.2f} (deviation {dev:+.2f} kJ/mol / "
+            f"combined σ {combined:.2f} kJ/mol)<br>"
+            f"Reference: {ref['reference_dG_kJmol']:+.2f} ± "
+            f"{ref['reference_dG_unc_kJmol']:.2f} kJ/mol "
+            f"({ref['reference_dG_kcal_mol']:+.2f} kcal/mol)<br>"
+            f"Your value: {cmp['measured_dG_kJmol']:+.2f} ± "
+            f"{cmp['measured_sigma_kJmol']:.2f} kJ/mol"
+        )
+        self._ref_result_label.setText(html)
 
     def set_result(self, result: Dict[str, Any]) -> None:
         """Populate the charts from a finished ``fep_run_sweep`` result."""

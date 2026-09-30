@@ -31,6 +31,14 @@ from .fep_checkpoint import (
     save_checkpoint,
 )
 from .fep_recipes import RECIPES, get_recipe, list_recipes
+from .fep_reference import (
+    REFERENCE_LIBRARY,
+    list_references,
+    list_runnable_references,
+    find_reference,
+    compare_to_reference,
+    best_reference_for,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -698,3 +706,91 @@ def ti_per_window(
         mean_hi = sum(e_hi) / len(e_hi)
         out[i] = -0.5 * (lam_hi - lam_lo) * (mean_hi + mean_lo)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Reference library + benchmark comparison
+# ---------------------------------------------------------------------------
+
+def fep_list_references(runnable_only: bool = False) -> Dict[str, Any]:
+    """List reference ΔG benchmarks.
+
+    Args:
+        runnable_only: If True, skip entries that need additional
+            parameterisation (e.g. Bosutinib needs antechamber).
+
+    Returns:
+        Dict with ``status``, ``n_references``, and ``references``
+        (list of reference dicts).
+    """
+    refs = list_runnable_references() if runnable_only else list_references()
+    return {
+        "status": "ok",
+        "n_references": len(refs),
+        "references": refs,
+    }
+
+
+def fep_compare_to_reference(
+    measured_dG_kJmol: float,
+    measured_sigma_kJmol: float,
+    reference_name: str,
+) -> Dict[str, Any]:
+    """Compare a measured ΔG against a named reference value.
+
+    Args:
+        measured_dG_kJmol: From your finished FEP sweep.
+        measured_sigma_kJmol: From BAR (or TI propagated SEM).
+        reference_name: One of the names from ``fep_list_references()``.
+
+    Returns:
+        Dict with agreement, z_score, deviation, combined
+        uncertainty, and the full reference entry. On unknown
+        reference name, status="unknown_reference" with the list
+        of available names.
+    """
+    return compare_to_reference(
+        measured_dG_kJmol=measured_dG_kJmol,
+        measured_sigma_kJmol=measured_sigma_kJmol,
+        reference_name=reference_name,
+    )
+
+
+def fep_compare_sweep_to_reference(
+    sweep_result: Dict[str, Any],
+    reference_name: str,
+) -> Dict[str, Any]:
+    """Compare a finished sweep result against a reference.
+
+    Convenience wrapper around ``fep_compare_to_reference`` that
+    pulls ``delta_g_kJmol`` and ``sigma_kJmol`` from the sweep
+    result dict (the same shape ``fep_run_sweep`` returns).
+    """
+    dg = sweep_result.get("delta_g_kJmol")
+    sig = sweep_result.get("sigma_kJmol")
+    if dg is None or sig is None:
+        return {"status": "error",
+                "error": "sweep_result has no delta_g_kJmol / sigma_kJmol"}
+    return compare_to_reference(
+        measured_dG_kJmol=dg,
+        measured_sigma_kJmol=sig,
+        reference_name=reference_name,
+    )
+
+
+def fep_best_reference(
+    mode: str,
+    target: Optional[str] = None,
+    pdb_file: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Pick the most likely matching reference for a sweep setup.
+
+    Useful for auto-defaulting the GUI's reference dropdown.
+    """
+    ref = best_reference_for(mode=mode, target=target, pdb_file=pdb_file)
+    if ref is None:
+        return {"status": "no_match",
+                "mode": mode,
+                "target": target,
+                "pdb_file": pdb_file}
+    return {"status": "ok", "reference": ref.to_dict()}

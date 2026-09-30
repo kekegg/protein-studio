@@ -265,6 +265,34 @@ TOOL_CATALOG: List[Dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "checkpoint_path": {"type": "string"},
      }, "required": ["checkpoint_path"], "additionalProperties": False}},
+    {"name": "fep_list_references", "description": (
+        "List the reference ΔG benchmark library (Shirts methane, "
+        "Wang Abl+Bosutinib, etc.). Set runnable_only=true to skip "
+        "entries that need additional parameterisation."),
+     "inputSchema": {"type": "object", "properties": {
+         "runnable_only": {"type": "boolean", "default": False},
+     }, "additionalProperties": False}},
+    {"name": "fep_compare_sweep_to_reference", "description": (
+        "Compare a finished sweep's delta_G against a named "
+        "reference. Returns z_score, deviation, and a one-line "
+        "agreement label ('within_1sigma' / 'within_2sigma' / "
+        "'outside_2sigma')."),
+     "inputSchema": {"type": "object", "properties": {
+         "sweep_result": {"type": "object",
+                          "description": "The dict returned by fep_run_sweep."},
+         "reference_name": {"type": "string"},
+     }, "required": ["sweep_result", "reference_name"],
+        "additionalProperties": False}},
+    {"name": "fep_best_reference", "description": (
+        "Heuristically pick the best matching reference for a "
+        "sweep's mode + target + pdb file. Useful to default the "
+        "GUI dropdown."),
+     "inputSchema": {"type": "object", "properties": {
+         "mode": {"type": "string",
+                  "enum": ["mutation", "ligand_decouple"]},
+         "target": {"type": "string"},
+         "pdb_file": {"type": "string"},
+     }, "required": ["mode"], "additionalProperties": False}},
 ]
 
 
@@ -499,6 +527,25 @@ def _dispatch(name: str, arguments: Dict[str, Any],
     if name == "fep_checkpoint_delete":
         from .core.fep_mcp import fep_checkpoint_delete as _fep_del
         return _fep_del(arguments["checkpoint_path"])
+    if name == "fep_list_references":
+        from .core.fep_mcp import fep_list_references as _fep_list_refs
+        return _fep_list_refs(runnable_only=arguments.get("runnable_only", False))
+    if name == "fep_compare_sweep_to_reference":
+        from .core.fep_mcp import (
+            fep_compare_sweep_to_reference as _fep_cmp,
+        )
+        return _fep_cmp(
+            sweep_result=arguments["sweep_result"],
+            reference_name=arguments["reference_name"],
+        )
+    if name == "fep_best_reference":
+        from .core.fep_mcp import fep_best_reference as _fep_best
+        kwargs = {"mode": arguments["mode"]}
+        if "target" in arguments:
+            kwargs["target"] = arguments["target"]
+        if "pdb_file" in arguments:
+            kwargs["pdb_file"] = arguments["pdb_file"]
+        return _fep_best(**kwargs)
     raise ValueError(f"unknown tool: {name}")
 
 
