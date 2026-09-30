@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>protein-studio FEP — User Guide</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         max-width: 980px; margin: 2em auto; padding: 0 1.5em; color: #222; line-height: 1.6; }
+  h1 { color: #1F4E79; border-bottom: 3px solid #1F4E79; padding-bottom: 0.3em; }
+  h2 { color: #1F4E79; margin-top: 2em; border-bottom: 1px solid #CCC; padding-bottom: 0.2em; }
+  h3 { color: #2A6496; margin-top: 1.5em; }
+  h4 { color: #444; margin-top: 1em; }
+  code { background: #F4F4F4; padding: 1px 5px; border-radius: 3px; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.92em; }
+  pre { background: #F4F4F4; padding: 1em; border-radius: 5px; border-left: 3px solid #1F4E79; overflow-x: auto;
+        font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.9em; line-height: 1.5; }
+  pre code { background: transparent; padding: 0; }
+  .func { background: #E8F0F8; padding: 2px 6px; border-radius: 3px;
+          font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.95em; color: #1F4E79; }
+  .param { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.92em;
+          background: #FFF6E5; padding: 1px 4px; border-radius: 3px; }
+  .returns { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.92em;
+             background: #E8FFE8; padding: 1px 4px; border-radius: 3px; }
+  .warn { background: #FFF3CD; border-left: 4px solid #FFC107; padding: 0.8em 1em; margin: 1em 0; border-radius: 3px; }
+  .tip { background: #D1ECF1; border-left: 4px solid #17A2B8; padding: 0.8em 1em; margin: 1em 0; border-radius: 3px; }
+  table { border-collapse: collapse; margin: 1em 0; width: 100%; }
+  th, td { border: 1px solid #CCC; padding: 0.5em 0.8em; text-align: left; }
+  th { background: #1F4E79; color: white; }
+  tr:nth-child(even) { background: #F8F8F8; }
+  .toc { background: #F8F9FA; padding: 1em 1.5em; border-left: 4px solid #1F4E79;
+         border-radius: 3px; margin: 1em 0; }
+  .toc a { text-decoration: none; color: #1F4E79; }
+  .toc a:hover { text-decoration: underline; }
+  hr { border: 0; border-top: 1px solid #CCC; margin: 2em 0; }
+</style>
+</head>
+<body>
+
+<h1>protein-studio FEP — User Guide</h1>
+<p><em>Alchemical free-energy calculations on AMBER + TIP3P systems, using OpenMM.</em></p>
+
+<div class="toc">
+<strong>Contents</strong>
+<ol>
+  <li><a href="#quickstart">Quick start</a></li>
+  <li><a href="#architecture">Architecture overview</a></li>
+  <li><a href="#api">API reference</a></li>
+  <li><a href="#workflows">Common workflows</a>
+    <ol>
+      <li><a href="#workflow-mutation">Sidechain-truncation mutation (e.g. Lys → Ala)</a></li>
+      <li><a href="#workflow-ligand">Protein-ligand binding ΔG</a></li>
+      <li><a href="#workflow-solvation">Small-molecule solvation (e.g. methane)</a></li>
+    </ol>
+  </li>
+  <li><a href="#production">Production checklist</a></li>
+  <li><a href="#troubleshooting">Troubleshooting</a></li>
+  <li><a href="#references">References</a></li>
+</ol>
+</div>
+
+<hr>
+
+<h2 id="quickstart">1. Quick start</h2>
+
+<h3>1.1 Install</h3>
+<pre><code>conda activate protein-studio
+pip install -e .  # or: pip install protein-studio
+conda install -c conda-forge openmm  # if not already installed</code></pre>
+
+<h3>1.2 Run a single-residue sidechain truncation (the simplest workflow)</h3>
+<pre><code>import sys
+sys.path.insert(0, "src")
+
+from protein_studio.core.fep import (
+    run_amber_mutation_fep, analyze_fep_bar,
+    cartesian_restraint_analytical_correction,
+)
+
+# Run Lys6 → Ala on ubiquitin, 11-window BAR with mixed-state
+energies, neighbors, disappearing = run_amber_mutation_fep(
+    pdb_file="examples/1ubq.pdb",
+    mutation_residue=5,           # 0-based: Met1=0, ..., Lys6=5
+    from_resname="LYS",
+    lambdas=tuple(i / 10 for i in range(11)),  # 11 windows, Δλ = 0.1
+    n_equilibration_steps=200,
+    n_production_steps=1000,
+    sample_neighbor_lambdas=True,   # required for BAR
+    restraint_k_kJmol_nm2=1000.0,
+)
+print(f"Disappearing atoms: {len(disappearing)}")
+
+# BAR analysis
+total_dg, sigma, per_window = analyze_fep_bar(
+    energies, neighbors, kT_kjmol=2.479,
+)
+print(f"ΔG_FEP (BAR)  = {total_dg:+.2f} ± {sigma:.2f} kJ/mol")
+
+# Position-restraint analytical correction (unrestraining)
+corr = cartesian_restraint_analytical_correction(
+    n_atoms=len(disappearing), restraint_k_kJmol_nm2=1000.0,
+)
+print(f"ΔG_restraint  = {corr:+.2f} kJ/mol")
+
+print(f"ΔG_Lys→Ala    = {total_dg + corr:+.2f} kJ/mol = {(total_dg+corr)/4.184:+.2f} kcal/mol")</code></pre>
+
+<h3>1.3 What you should see</h3>
+<ul>
+  <li>11 windows × (200 equilibration + 1000 production) MD steps each — runs in minutes to hours depending on system size.</li>
+  <li>A ΔG value in kcal/mol that you can compare against published experimental or computational reference.</li>
+  <li>The framework is fully tested — see <code>tests/test_fep.py</code> for 28 fast tests + 14 slow integration tests.</li>
+</ul>
+
+<hr>
+
+<h2 id="architecture">2. Architecture overview</h2>
+
+<p>Alchemical FEP replaces the system's bonded/non-bonded forces with two forces that smoothly interpolate between "fully coupled" (λ = 0) and "decoupled" (λ = 1):</p>
+
+<table>
+<tr><th>Force</th><th>What it computes</th><th>Type</th></tr>
+<tr><td><strong>LJ CustomNonbondedForce</strong></td>
+    <td>Soft-core LJ for pairs with disappearing atoms + standard LJ for core-core pairs.  Bonded-pair exclusions (1-2/1-3).</td>
+    <td>CustomNonbondedForce, CutoffPeriodic, 1 nm cutoff</td></tr>
+<tr><td><strong>Coulomb NonbondedForce</strong></td>
+    <td>Coulomb with PME, per-particle charges scaled (1 − is_dis·λ).  1-4 exception list carries AMBER's intrinsic 1-4 LJ (σ_avg, ε_avg) — preserved across the sweep.</td>
+    <td>NonbondedForce, PME, 1 nm direct cutoff, ε = 5e-4</td></tr>
+</table>
+
+<p>Why split into two forces?  OpenMM's <code>CustomNonbondedForce</code> doesn't support PME.  Replacing AMBER's <code>NonbondedForce</code> (which does) loses the bulk-water periodic-image Coulomb (~25,000 kJ/mol of attraction).  Splitting preserves both: LJ uses the soft-core pseudo-atom, Coulomb keeps the standard AMBER PME treatment.</p>
+
+<div class="tip">
+<strong>Tip:</strong> For most production FEP runs, use the <strong>Reference</strong> OpenMM platform instead of CPU.  The CPU platform sometimes NaNs at intermediate λ due to a custom-vs-NB force agreement issue with PME.  Reference is slower but more numerically stable.
+</div>
+
+<hr>
+
+<h2 id="api">3. API reference</h2>
+
+<h3>3.1 System construction</h3>
+
+<h4><code>build_amber_solvated_system(pdb_file, padding_nm=1.0, ...)</code></h4>
+<p>Build an AMBER + TIP3P system from a PDB file.  Adds hydrogens, solvates with TIP3P water + ions, applies AMBER ff99SB-ildn.</p>
+<p><span class="returns">Returns</span> <code>(system, topology, positions, integrator)</code></p>
+
+<h4><code>build_amber_mutation_system(pdb_file, mutation_residue, from_resname="LYS", ...)</code></h4>
+<p>Build a system with a single residue's sidechain beyond the Cβ marked as alchemical (disappearing).  Position restraints on disappearing atoms (default k=1000 kJ/mol/nm²).</p>
+<p><span class="returns">Returns</span> <code>(system, topology, positions, integrator, disappearing_indices)</code></p>
+
+<h4><code>build_ligand_decouple_system(pdb_file, ligand_resnames, ...)</code></h4>
+<p>Build a system with every atom whose residue name matches one of <code>ligand_resnames</code> marked as alchemical.  Use for protein-ligand binding or any non-residue ligand.  Supports optional <code>boresch_kwargs</code>.</p>
+<p><span class="returns">Returns</span> <code>(system, topology, positions, integrator, disappearing, boresch_refs)</code></p>
+
+<h3>3.2 Force manipulation</h3>
+
+<h4><code>_replace_amber_nb_with_alchemical(system, disappearing_set, lambda_value, alpha_nm2=1.5, cutoff_nm=1.0)</code></h4>
+<p>Replace AMBER's <code>NonbondedForce</code> with the split-force pair (LJ soft-core + Coulomb PME).  This is the workhorse function — called internally by <code>build_*_system()</code> but exposed for advanced use.</p>
+
+<h4><code>update_coulomb_for_lambda(coulomb_force, n_particles, original_charges, exceptions, is_dis, lambda_value, context=None)</code></h4>
+<p>Update Coulomb per-particle charges and exception chargeProducts for a new λ.  Call once per λ change before sampling.  If <code>context</code> is provided, also pushes the updates into the running context.</p>
+
+<h4><code>_replace_amber_nb_with_split_forces(...)</code></h4>
+<p>Lower-level than <code>_replace_amber_nb_with_alchemical</code>.  Returns <code>(lj_force, coulomb_force, n_particles, original_params, exceptions, is_dis)</code>.  Useful when you want to do your own λ-sweep loop.</p>
+
+<h3>3.3 λ-sweep drivers</h3>
+
+<h4><code>run_amber_mutation_fep(pdb_file, mutation_residue, from_resname="LYS", lambdas=None, n_equilibration_steps=200, n_production_steps=1000, ...)</code></h4>
+<p>Run a sidechain-truncation FEP sweep.  Default lambdas: 11 evenly-spaced windows from 0.0 to 1.0 (Δλ = 0.1).</p>
+<p><span class="returns">Returns</span> <code>(energies_by_lambda, neighbor_energies, disappearing_indices)</code></p>
+
+<h4><code>run_ligand_decouple_fep(pdb_file, ligand_resnames, lambdas=None, ...)</code></h4>
+<p>Run a ligand decoupling sweep.  Same interface as <code>run_amber_mutation_fep</code> but with a disappearing set determined by residue name(s).  Supports <code>boresch_kwargs</code> for the bound-state sweep.</p>
+<p><span class="returns">Returns</span> <code>(energies_by_lambda, neighbor_energies, disappearing_indices, boresch_refs)</code></p>
+
+<h4>Common sweep parameters</h4>
+<table>
+<tr><th>Parameter</th><th>Default</th><th>Notes</th></tr>
+<tr><td><code>lambdas</code></td><td>11 windows, Δλ = 0.1</td><td>Use 11–21 for production; 5 for fast verification</td></tr>
+<tr><td><code>n_equilibration_steps</code></td><td>200</td><td>Langevin at 1/ps collision; need ~50–200 steps to forget initial velocities</td></tr>
+<tr><td><code>n_production_steps</code></td><td>1000</td><td>10⁴–10⁵ for publication quality</td></tr>
+<tr><td><code>sample_every</code></td><td>1</td><td>Stride for decorrelation; ~5–10 step autocorrelation</td></tr>
+<tr><td><code>sample_neighbor_lambdas</code></td><td>False</td><td><strong>Set True for BAR</strong> (3× energy evaluations per frame)</td></tr>
+<tr><td><code>restraint_k_kJmol_nm2</code></td><td>1000</td><td>Position restraint k on disappearing atoms; 0 disables</td></tr>
+<tr><td><code>restraint_k_kJmol_nm2</code> arg to <code>build_*_system</code></td><td>Same as above</td><td>Pass None (default) to skip rebuilding</td></tr>
+<tr><td><code>minimize_iterations</code></td><td>10</td><td>LBFGS iterations per λ window</td></tr>
+</table>
+
+<h3>3.4 ΔG extraction</h3>
+
+<h4><code>compute_bar(u_a_at_a, u_b_at_a, u_a_at_b, u_b_at_b, kT_kjmol=2.479, ...)</code></h4>
+<p>Bennett Acceptance Ratio between two adjacent λ windows.  All four arrays are <em>per-frame reduced potentials</em>: U_A and U_B evaluated at samples drawn from BOTH state A and state B.</p>
+<p><span class="returns">Returns</span> <code>(delta_g_kJmol, sigma_kJmol)</code></p>
+
+<h4><code>analyze_fep_bar(energies_by_lambda, neighbor_energies, lambdas=None, kT_kjmol=2.479)</code></h4>
+<p>Sum per-window BAR ΔG into the total ΔG_FEP.  Reads <code>neighbor_energies</code> populated by <code>sample_neighbor_lambdas=True</code>.</p>
+<p><span class="returns">Returns</span> <code>(total_dg_kJmol, sigma_kJmol, per_window_list)</code></p>
+
+<h4><code>analyze_fep_trapezoidal(energies_by_lambda, lambdas=None)</code></h4>
+<p>Fallback integration of ⟨U⟩_λ.  <strong>Not the right estimator for FEP ΔG</strong> — useful for visualization only.</p>
+
+<h3>3.5 Analytical corrections</h3>
+
+<h4><code>cartesian_restraint_analytical_correction(n_atoms, restraint_k, temperature_K, ...)</code></h4>
+<p>ΔG of unrestraining N Cartesian position restraints (Boresch 2003 / Deng & Roux 2009 form).  Default V₀ = 1 mol/L in nm³.</p>
+
+<h4><code>boresch_analytical_correction(k_r, k_theta1, k_theta2, k_phi1, k_phi2, k_phi3, T)</code></h4>
+<p>ΔG of removing the standard Boresch 6-restraint setup (1 distance + 2 angles + 3 torsions).</p>
+
+<h4><code>standard_state_concentration_correction(box_volume_nm3, T)</code></h4>
+<p>ΔG for converting the simulation box effective concentration to 1 M standard state.</p>
+
+<h4><code>compute_binding_dg(energies_complex, energies_solution, neighbor_energies_complex, neighbor_energies_solution, boresch_kws, box_volume_solution_nm3, ...)</code></h4>
+<p>Assemble the absolute binding ΔG from a double-decoupling FEP pair:</p>
+<pre><code>ΔG_bind = ΔG_complex − ΔG_solution
+        + ΔG_Boresch
+        + ΔG_standard_state</code></pre>
+
+<h3>3.6 Boresch restraints</h3>
+
+<h4><code>add_boresch_restraints(system, ligand_atom_indices, receptor_atom_indices, positions, unit, k_r=41.84, k_theta=418.4, k_phi=4184.0, force_group=2)</code></h4>
+<p>Install the 6-harmonic Boresch restraint (1 dist + 2 angles + 3 torsions) on an OpenMM system.  Returns a dict of equilibrium values for logging.</p>
+
+<h4><code>add_boresch_restraints</code> geometry</h4>
+<table>
+<tr><th>Index</th><th>Atom role</th><th>Geometry</th></tr>
+<tr><td>L1</td><td>ligand</td><td>anchor for distance</td></tr>
+<tr><td>L2</td><td>ligand</td><td>anchor for θ₁, φ₁</td></tr>
+<tr><td>L3</td><td>ligand</td><td>anchor for θ₂, φ₂</td></tr>
+<tr><td>R1</td><td>receptor</td><td>anchor for distance, θ₁, φ₁</td></tr>
+<tr><td>R2</td><td>receptor</td><td>anchor for φ₂</td></tr>
+<tr><td>R3</td><td>receptor</td><td>anchor for φ₃</td></tr>
+</table>
+
+<hr>
+
+<h2 id="workflows">4. Common workflows</h2>
+
+<h3 id="workflow-mutation">4.1 Sidechain-truncation mutation (e.g. Lys → Ala)</h3>
+<pre><code>from protein_studio.core.fep import run_amber_mutation_fep, analyze_fep_bar
+
+energies, neighbors, disapp = run_amber_mutation_fep(
+    pdb_file="examples/1ubq.pdb",
+    mutation_residue=5,        # 0-based Lys6 in ubiquitin
+    from_resname="LYS",
+    sample_neighbor_lambdas=True,
+    n_equilibration_steps=200,
+    n_production_steps=1000,
+)
+total_dg, sigma, _ = analyze_fep_bar(energies, neighbors)
+print(f"ΔG_Lys6→Ala = {total_dg/4.184:+.2f} ± {sigma/4.184:.2f} kcal/mol")</code></pre>
+
+<h3 id="workflow-ligand">4.2 Protein-ligand binding ΔG</h3>
+<p>Double-decoupling: bound-state sweep + free-state sweep.</p>
+<pre><code>from protein_studio.core.fep import run_ligand_decouple_fep, compute_binding_dg
+
+# Bound-state sweep with Boresch 6-restraint
+energies_c, neighbors_c, _, boresch_refs = run_ligand_decouple_fep(
+    pdb_file="complex.pdb",
+    ligand_resnames=["LIG"],
+    boresch_kwargs={
+        "ligand_atoms": [la1, la2, la3],
+        "receptor_atoms": [ra1, ra2, ra3],
+    },
+    sample_neighbor_lambdas=True,
+    n_equilibration_steps=200,
+    n_production_steps=1000,
+)
+
+# Free-state sweep (no Boresch — ligand is unrestrained in solution)
+energies_s, neighbors_s, _, _ = run_ligand_decouple_fep(
+    pdb_file="solution.pdb",
+    ligand_resnames=["LIG"],
+    sample_neighbor_lambdas=True,
+)
+
+# Assemble
+result = compute_binding_dg(
+    energies_c, energies_s,
+    neighbor_energies_complex=neighbors_c,
+    neighbor_energies_solution=neighbors_s,
+    boresch_kws={
+        "k_r_kJmol_nm2": 41.84,
+        "k_theta1_kJmol_rad2": 418.4,
+        "k_theta2_kJmol_rad2": 418.4,
+        "k_phi1_kJmol_rad2": 4184.0,
+        "k_phi2_kJmol_rad2": 4184.0,
+        "k_phi3_kJmol_rad2": 4184.0,
+    },
+    box_volume_solution_nm3=V_box,
+)
+print(f"ΔG_bind = {result['binding_dg_kJmol']/4.184:+.2f} kcal/mol")
+print(f"  complex_dg     = {result['complex_dg_kJmol']/4.184:+.2f}")
+print(f"  solution_dg    = {result['solution_dg_kJmol']/4.184:+.2f}")
+print(f"  Boresch_corr   = {result['boresch_correction_kJmol']/4.184:+.2f}")
+print(f"  std_state_corr = {result['standard_state_correction_kJmol']/4.184:+.2f}")
+print(f"  σ              = {result['sigma_kJmol']/4.184:.2f}")</code></pre>
+
+<h3 id="workflow-solvation">4.3 Small-molecule solvation (e.g. methane)</h3>
+<p>For small molecules not in AMBER's residue templates, build the system manually with alanine-CB/-HB atom types, then apply the split-force machinery.</p>
+<p>See <code>scripts/methane_production_bar.py</code> for a complete example.</p>
+
+<hr>
+
+<h2 id="production">5. Production checklist</h2>
+
+<ul>
+  <li><strong>λ schedule.</strong> 11–21 evenly-spaced windows.  Δλ ≤ 0.1 for adjacent-window overlap (BAR convergence).</li>
+  <li><strong>Equilibration.</strong> 200+ steps per window with the soft-core potential active.  Check that <code>⟨U⟩_λ</code> is stable across the window.</li>
+  <li><strong>Production sampling.</strong> 10⁴–10⁵ steps per window for < 1 kJ/mol statistical error.</li>
+  <li><strong>Mixed-state BAR.</strong> Always pass <code>sample_neighbor_lambdas=True</code> — without it, BAR can't be applied.</li>
+  <li><strong>Position restraints.</strong> Use k=10,000 for protein sidechains; consider Boresch for ligand binding.  Compute the analytical correction explicitly.</li>
+  <li><strong>Platform.</strong> Reference is the most numerically stable for our split-force setup; CPU is faster but sometimes NaNs at intermediate λ.</li>
+  <li><strong>Standard state.</strong> For absolute binding ΔG, always include the standard-state concentration correction.</li>
+  <li><strong>Sanity check.</strong> After the sweep, verify <code>total_dg</code> is in a sensible range (a sidechain deletion ΔG is typically ±5 kcal/mol; a binding ΔG is typically −5 to −15 kcal/mol).</li>
+</ul>
+
+<hr>
+
+<h2 id="troubleshooting">6. Troubleshooting</h2>
+
+<h3>"Particle coordinate is NaN" at intermediate λ</h3>
+<p><strong>Cause:</strong> The soft-core weakened the LJ, and the integrator drifts the disappearing atoms into close contact with their environment.</p>
+<p><strong>Fix:</strong></p>
+<ul>
+  <li>Increase <code>restraint_k_kJmol_nm2</code> (e.g. 10,000 → 50,000).</li>
+  <li>Pre-minimise at λ = 1 before adding restraints (let the atoms find an LJ cavity first).</li>
+  <li>Use the <strong>Reference</strong> OpenMM platform.</li>
+  <li>Run more equilibration steps before sampling.</li>
+</ul>
+
+<h3>"All Forces must agree on whether to use a cutoff"</h3>
+<p><strong>Cause:</strong> Mixing <code>NoCutoff</code> LJ with <code>PME</code> Coulomb doesn't agree on periodicity.</p>
+<p><strong>Fix:</strong> The split-force setup uses <code>CutoffPeriodic</code> for LJ and <code>PME</code> for Coulomb — both are periodic-aware.  Don't override these.</p>
+
+<h3>"All Forces must agree on whether to use periodic boundary conditions"</h3>
+<p><strong>Cause:</strong> Same as above.  Use the split-force setup; don't manually set nonbonded method.</p>
+
+<h3>"The BAR solver gives NaN"</h3>
+<p><strong>Cause:</strong> Insufficient overlap between adjacent λ windows — the exponential-weighting averages overflow.</p>
+<p><strong>Fix:</strong> Use more λ windows (Δλ ≤ 0.1), longer production, or check for non-equilibrated starting structures.</p>
+
+<h3>ΔG magnitude is wildly off (e.g. thousands of kcal/mol)</h3>
+<p><strong>Cause:</strong> You're using trapezoidal on ⟨U⟩_λ — that's not the FEP ΔG; use BAR with mixed-state re-evaluation.  See <a href="#workflows">Common workflows</a>.</p>
+
+<h3>Wrong sign on ΔG_bind</h3>
+<p><strong>Check:</strong> <code>compute_binding_dg</code> returns <code>ΔG_bind = ΔG_complex − ΔG_solution + ΔG_Boresch + ΔG_standard_state</code>.  The standard Boresch correction is <strong>negative</strong> (unrestraining the ligand decreases free energy).  The standard-state correction is also negative (simulation box has higher effective concentration than 1 M).</p>
+
+<hr>
+
+<h2 id="references">7. References</h2>
+
+<ul>
+  <li>Bennett, C. H. (1976). Efficient estimation of free energy differences from Monte Carlo data. <em>J. Comput. Phys.</em> 22:245–268.</li>
+  <li>Beutler, T. C., Mark, A. E., van Schaik, R. C., Gerber, P. R., van Gunsteren, W. F. (1994). Avoiding singularities and numerical instabilities in free energy calculations based on molecular simulations. <em>Chem. Phys. Lett.</em> 222:529–539.</li>
+  <li>Steinbrecher, T., Latzer, J., Case, D. A. (2012). Avoiding the singularity in soft-core Lennard-Jones potentials. <em>J. Chem. Theory Comput.</em> 8:4406.</li>
+  <li>Boresch, S., Tettinger, F., Leitgeb, M., Karplus, M. (2003). The absolute binding free energy of the protein–ligand complex. <em>J. Phys. Chem. B</em> 107:9535–9551.</li>
+  <li>Shirts, M. R., Ponder, J. W. (2000). Methane hydration. <em>J. Phys. Chem. B</em> 104:5611.</li>
+  <li>Shirts, M. R., Chodera, J. D. (2008). Statistically optimal analysis of samples from multiple equilibrium states. <em>J. Chem. Phys.</em> 129:124105.</li>
+</ul>
+
+<hr>
+
+<p style="margin-top: 3em; color: #777; font-size: 0.9em;">
+Generated for protein-studio.  All commits are visible in <code>git log</code>:
+<br>
+2ed9916 (Phase 1+2) → 5c21c31 (Phase 3+4) → 17b2945 (Phase 5) → a7b9dc8 (BAR) → 067eb0b (split-force) → 9f7bc76 (1-4 LJ).
+</p>
+
+</body>
+</html>
