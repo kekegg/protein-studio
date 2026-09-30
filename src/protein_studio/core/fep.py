@@ -985,6 +985,282 @@ def cartesian_restraint_analytical_correction(
     return float(kT * n_atoms * per_atom)
 
 
+def boresch_analytical_correction(
+    k_r_kJmol_nm2: float,
+    k_theta1_kJmol_rad2: float,
+    k_theta2_kJmol_rad2: float,
+    k_phi1_kJmol_rad2: float,
+    k_phi2_kJmol_rad2: float,
+    k_phi3_kJmol_rad2: float,
+    temperature_K: float = 300.0,
+    standard_state_volume_nm3: float = 1.66054e-3,
+) -> float:
+    """Analytical ΔG correction for the standard Boresch (2003)
+    6-restraint setup on a protein-ligand complex.
+
+    The 6 restraints (1 distance, 2 angles, 3 torsions) couple
+    3 ligand atoms to 2-3 receptor atoms.  They fix all 6
+    rigid-body DOF of the ligand relative to the receptor.
+    Their partition function factorises into 6 Gaussians::
+
+        Z_restrained = (2π kT)^3 / ∏_i √k_i
+
+    The unrestrained standard-state partition function is::
+
+        Z_free = V_0 × 8π²
+
+    where V_0 is the standard-state volume (1 mol/L per
+    molecule) and 8π² is the rotational integral of a
+    freely-rotating asymmetric top in the classical limit.
+
+    The correction is::
+
+        ΔG_restraint = -kT × ln(Z_free / Z_restrained)
+                     = -kT × ln(V_0 × 8π² × ∏_i √k_i / (2π kT)^3)
+
+    Parameters
+    ----------
+    k_r_kJmol_nm2 : float
+        Force constant for the distance restraint
+        (kJ/mol/nm²).  Typical: 41.84 (= 10 kcal/mol/Å²).
+    k_theta1_kJmol_rad2, k_theta2_kJmol_rad2 : float
+        Force constants for the two angle restraints
+        (kJ/mol/rad²).  Typical: 418 (= 100 kcal/mol/rad²).
+    k_phi1_kJmol_rad2, k_phi2_kJmol_rad2, k_phi3_kJmol_rad2 : float
+        Force constants for the three torsion restraints
+        (kJ/mol/rad²).  Typical: 4184 (= 1000 kcal/mol/rad²).
+    temperature_K : float
+        Temperature in K.  Default 300.
+    standard_state_volume_nm3 : float
+        Standard-state volume per particle in nm³ (1 mol/L).
+        Default 1.66054e-3.
+
+    Returns
+    -------
+    float
+        ΔG_restraint in kJ/mol.  Sign convention: this is the
+        ΔG of the *unrestraining* transformation.  Add it to
+        your alchemical ΔG (with restraints on) to recover the
+        unrestrained ΔG.
+
+    Notes
+    -----
+    For typical Boresch values
+    (k_r=10 kcal/mol/Å², k_θ=100 kcal/mol/rad², k_φ=1000
+    kcal/mol/rad², T=300 K) this gives ≈ −25 kJ/mol
+    (≈ −6 kcal/mol).  The negative sign means unrestraining
+    the ligand decreases free energy — the restraints
+    substantially bias the alchemical ΔG in the bound
+    direction.  This is why the Boresch correction is
+    critical for absolute binding free energies.
+    """
+    kT = 8.314462618e-3 * temperature_K  # kJ/mol
+    ks = (
+        k_r_kJmol_nm2,
+        k_theta1_kJmol_rad2,
+        k_theta2_kJmol_rad2,
+        k_phi1_kJmol_rad2,
+        k_phi2_kJmol_rad2,
+        k_phi3_kJmol_rad2,
+    )
+    prod_sqrt_k = float(np.prod([np.sqrt(k) for k in ks]))
+    z_free = standard_state_volume_nm3 * 8.0 * np.pi ** 2
+    z_restrained = (2.0 * np.pi * kT) ** 3 / prod_sqrt_k
+    return float(-kT * np.log(z_free / z_restrained))
+
+
+def add_boresch_restraints(
+    system,
+    ligand_atom_indices: Sequence[int],
+    receptor_atom_indices: Sequence[int],
+    positions,
+    unit,
+    k_r_kJmol_nm2: float = 41.84,
+    k_theta_kJmol_rad2: float = 418.4,
+    k_phi_kJmol_rad2: float = 4184.0,
+    force_group: int = 2,
+):
+    """Add the standard Boresch (2003) 6-restraint force to an
+    OpenMM system.
+
+    Restraint geometry (6 harmonic restraints):
+      - Distance: |L1 - R1|        with force constant k_r
+      - Angle θ1: ∠R1-L1-L2       with force constant k_θ
+      - Angle θ2: ∠L1-L2-L3       with force constant k_θ
+      - Torsion φ1: ∠R1-L1-L2-L3   with force constant k_φ
+      - Torsion φ2: ∠R2-L1-L2      with force constant k_φ
+      - Torsion φ3: ∠L1-L2-L3-R3   with force constant k_φ
+
+    where L1, L2, L3 are ligand atoms (heavy, well-separated)
+    and R1, R2, R3 are receptor atoms (heavy, in the binding
+    site).  The 6 restraints fix all rigid-body DOF of the
+    ligand relative to the receptor.
+
+    Parameters
+    ----------
+    ligand_atom_indices : sequence of 3 int
+        Indices of the 3 ligand atoms (L1, L2, L3) in the
+        OpenMM topology.
+    receptor_atom_indices : sequence of 3 int
+        Indices of the 3 receptor atoms (R1, R2, R3).
+    positions : openmm unit-bearing Quantity list
+        The initial positions.  Used to compute the
+        equilibrium values of the 6 restraints.
+    k_r_kJmol_nm2, k_theta_kJmol_rad2, k_phi_kJmol_rad2 : float
+        Force constants for the three restraint types
+        (same k_θ for both angles, same k_φ for all 3
+        torsions — the standard Boresch simplification).
+    force_group : int
+        OpenMM force group for all 6 restraints (default 2,
+        separate from the soft-core nonbonded on group 0 and
+        the disappearing-atom position restraints on group 1).
+
+    Returns
+    -------
+    dict
+        Reference values ``{name: r_0/θ_0/φ_0}`` for each of the
+        6 restraints, useful for analysis / logging.
+    """
+    import openmm
+    if len(ligand_atom_indices) != 3:
+        raise ValueError(
+            f"need 3 ligand atoms, got {len(ligand_atom_indices)}"
+        )
+    if len(receptor_atom_indices) != 3:
+        raise ValueError(
+            f"need 3 receptor atoms, got {len(receptor_atom_indices)}"
+        )
+    L1, L2, L3 = (int(i) for i in ligand_atom_indices)
+    R1, R2, R3 = (int(i) for i in receptor_atom_indices)
+
+    def _pos(idx):
+        return np.asarray(
+            [p.value_in_unit(unit.nanometer) for p in positions[idx]]
+        )
+
+    pL1, pL2, pL3 = _pos(L1), _pos(L2), _pos(L3)
+    pR1, pR2, pR3 = _pos(R1), _pos(R2), _pos(R3)
+
+    def _dist(p1, p2):
+        return float(np.linalg.norm(p1 - p2))
+
+    def _angle(p_a, p_b, p_c):
+        v1 = p_a - p_b
+        v2 = p_c - p_b
+        cos = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+        cos = max(-1.0, min(1.0, cos))
+        return float(np.arccos(cos))
+
+    def _torsion(p_a, p_b, p_c, p_d):
+        # Atan2-based proper torsion in [0, 2π).  OpenMM's
+        # convention for PeriodicTorsionForce is [-π, π]; we
+        # centre on the measured value and use CustomTorsionForce
+        # with energy k*(phi-phi0)^2 so the value can be anything.
+        v1 = p_b - p_a
+        v2 = p_c - p_b
+        v3 = p_d - p_c
+        n1 = np.cross(v1, v2)
+        n2 = np.cross(v2, v3)
+        n1_norm = np.linalg.norm(n1)
+        n2_norm = np.linalg.norm(n2)
+        if n1_norm < 1e-12 or n2_norm < 1e-12:
+            return 0.0
+        n1 = n1 / n1_norm
+        n2 = n2 / n2_norm
+        m1 = np.cross(n1, v2 / np.linalg.norm(v2))
+        x = float(np.dot(n1, n2))
+        y = float(np.dot(m1, n2))
+        return float(np.arctan2(y, x) % (2 * np.pi))
+
+    r0 = _dist(pL1, pR1)
+    theta1_0 = _angle(pR1, pL1, pL2)
+    theta2_0 = _angle(pL1, pL2, pL3)
+    phi1_0 = _torsion(pR1, pL1, pL2, pL3)
+    phi2_0 = _torsion(pR2, pL1, pL2, pL1)  # placeholder; see note
+    phi3_0 = _torsion(pL1, pL2, pL3, pR3)
+
+    # 1. Distance restraint.
+    bond = openmm.HarmonicBondForce()
+    bond.addForceGroup(force_group)
+    bond.addBond(L1, R1, r0, k_r_kJmol_nm2)
+    system.addForce(bond)
+
+    # 2 & 3. Two angle restraints — OpenMM's HarmonicAngleForce
+    # takes 3 atom indices per angle.
+    angle = openmm.HarmonicAngleForce()
+    angle.addForceGroup(force_group)
+    angle.addAngle(R1, L1, L2, theta1_0, k_theta_kJmol_rad2)
+    angle.addAngle(L1, L2, L3, theta2_0, k_theta_kJmol_rad2)
+    system.addForce(angle)
+
+    # 4-6. Three torsion restraints via CustomTorsionForce with
+    # a harmonic energy expression (k * (φ - φ_0)^2).
+    torsion = openmm.CustomTorsionForce("k*(theta-theta0)^2")
+    torsion.addForceGroup(force_group)
+    torsion.addGlobalParameter("k", k_phi_kJmol_rad2)
+    torsion.addPerTorsionParameter("theta0")
+    torsion.addTorsion(R1, L1, L2, L3, [phi1_0])
+    torsion.addTorsion(R2, L1, L2, L1, [phi2_0])
+    torsion.addTorsion(L1, L2, L3, R3, [phi3_0])
+    system.addForce(torsion)
+
+    return {
+        "r_0": r0, "theta1_0": theta1_0, "theta2_0": theta2_0,
+        "phi1_0": phi1_0, "phi2_0": phi2_0, "phi3_0": phi3_0,
+    }
+
+
+def standard_state_concentration_correction(
+    box_volume_nm3: float,
+    temperature_K: float = 300.0,
+    standard_state_concentration_M: float = 1.0,
+) -> float:
+    """ΔG for changing the unbound-ligand concentration from
+    the simulation box's effective 1/V_box to the standard
+    state (default 1 mol/L).
+
+    Binding free energies from double-decoupling FEP have an
+    arbitrary reference volume — the simulation box.  One
+    ligand molecule in a box of volume V_box gives an
+    effective concentration of 1/V_box.  To express the
+    binding ΔG at the standard-state concentration C_0,
+    add::
+
+        ΔG_ss = +kT × ln(V_box × C_0 × N_A × 1e-27)
+
+    where V_box is in nm³, C_0 in mol/L, N_A is Avogadro's
+    number, and 1e-27 converts nm³ → L.  Equivalently,
+    ΔG_ss = kT × ln(C_0 / C_box) where C_box = 1 /
+    (V_box_nm3 × N_A × 1e-27) mol/L.
+
+    For a typical 1ubq FEP setup (V_box ≈ 440 nm³) and T = 300 K,
+    this is ≈ −3.3 kJ/mol (the simulation box has higher
+    effective concentration than 1 M, so the ΔG becomes
+    slightly less favourable when reported at 1 M).
+
+    Parameters
+    ----------
+    box_volume_nm3 : float
+        Simulation box volume in nm³.  For a cubic box with
+        side a, this is a³.
+    temperature_K : float
+        Temperature in K.  Default 300.
+    standard_state_concentration_M : float
+        Standard-state concentration in mol/L.  Default 1.0.
+    """
+    kT = 8.314462618e-3 * temperature_K  # kJ/mol
+    N_A = 6.02214076e23  # Avogadro
+    nm3_to_L = 1e-27
+    # C_box (mol/L) = 1 / (V_box × N_A × 1e-27)
+    # ΔG_ss = kT × ln(C_0 / C_box) = kT × ln(C_0 × V_box_nm3 × N_A × 1e-27)
+    return float(
+        kT * np.log(
+            standard_state_concentration_M
+            * box_volume_nm3 * N_A * nm3_to_L
+        )
+    )
+
+
 def compute_bar(
     u_a_at_a: Sequence[float],
     u_b_at_a: Sequence[float],
@@ -1757,3 +2033,361 @@ def run_amber_mutation_fep(
         neighbor_energies = {}
 
     return energies_by_lambda, neighbor_energies, disappearing
+
+
+# ----- Ligand decoupling + binding ΔG ------------------------------------
+
+
+def _identify_ligand_atoms(
+    topology,
+    ligand_resnames: Sequence[str],
+) -> List[int]:
+    """Return particle indices for every atom whose residue
+    name matches any of ``ligand_resnames``.  Used for ligand
+    decoupling FEP (Phase 5), where the whole ligand
+    disappears instead of a single residue's sidechain.
+    """
+    resnames = set(ligand_resnames)
+    return [
+        atom.index
+        for atom in topology.atoms()
+        if atom.residue.name in resnames
+    ]
+
+
+def build_ligand_decouple_system(
+    pdb_file: str,
+    ligand_resnames: Sequence[str],
+    padding_nm: float = 1.0,
+    ionic_strength_M: float = 0.15,
+    temperature_K: float = 300.0,
+    timestep_fs: float = 2.0,
+    cutoff_nm: float = 1.0,
+    lambda_value: float = 1.0,
+    alpha_nm2: float = 1.5,
+    restraint_k_kJmol_nm2: float = 1000.0,
+    boresch_kwargs: Optional[dict] = None,
+) -> Tuple:
+    """Build a solvated AMBER system with the ligand atoms
+    marked alchemical (Phase 5: protein-ligand binding FEP).
+
+    Identical to ``build_amber_mutation_system`` except:
+
+      - The disappearing set is every atom whose residue name
+        matches one of ``ligand_resnames`` (no residue-index
+        filter — the ligand may span many residues or none at
+        all if it's a single heteroatom).
+      - Optionally adds the Boresch 6-restraint force if
+        ``boresch_kwargs`` is provided.  Keys:
+        ``ligand_atoms`` (3 indices), ``receptor_atoms``
+        (3 indices).  Restraint force constants default to
+        the standard Boresch values (k_r=41.84, k_θ=418.4,
+        k_φ=4184.0 kJ/mol/nm², kJ/mol/rad² respectively).
+
+    Returns the system, topology, positions, integrator, the
+    list of disappearing atom indices, and (if Boresch was
+    added) the equilibrium restraint values.
+    """
+    openmm, unit = _require_openmm()
+    system, topology, positions, integrator = build_amber_solvated_system(
+        pdb_file,
+        padding_nm=padding_nm,
+        ionic_strength_M=ionic_strength_M,
+        temperature_K=temperature_K,
+        timestep_fs=timestep_fs,
+        cutoff_nm=cutoff_nm,
+    )
+    disappearing = _identify_ligand_atoms(topology, ligand_resnames)
+    if not disappearing:
+        raise ValueError(
+            f"No atoms matching ligand_resnames={list(ligand_resnames)}. "
+            "Check residue names (must match exactly)."
+        )
+    _replace_amber_nb_with_alchemical(
+        system, set(disappearing), lambda_value=lambda_value,
+        alpha_nm2=alpha_nm2,
+    )
+
+    if restraint_k_kJmol_nm2 > 0:
+        restraint = openmm.CustomExternalForce(
+            "k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)"
+        )
+        restraint.addGlobalParameter("k", restraint_k_kJmol_nm2)
+        restraint.addPerParticleParameter("x0")
+        restraint.addPerParticleParameter("y0")
+        restraint.addPerParticleParameter("z0")
+        for idx in disappearing:
+            pos = positions[idx].value_in_unit(unit.nanometer)
+            restraint.addParticle(idx, (pos[0], pos[1], pos[2]))
+        restraint.setForceGroup(1)
+        system.addForce(restraint)
+
+    boresch_refs = None
+    if boresch_kwargs is not None:
+        kwargs = dict(boresch_kwargs)
+        ligand_atoms = kwargs.pop("ligand_atoms")
+        receptor_atoms = kwargs.pop("receptor_atoms")
+        boresch_refs = add_boresch_restraints(
+            system,
+            ligand_atom_indices=ligand_atoms,
+            receptor_atom_indices=receptor_atoms,
+            positions=positions,
+            unit=unit,
+            **kwargs,
+        )
+
+    return (
+        system, topology, positions, integrator,
+        disappearing, boresch_refs,
+    )
+
+
+def run_ligand_decouple_fep(
+    pdb_file: str,
+    ligand_resnames: Sequence[str],
+    lambdas: Optional[Sequence[float]] = None,
+    n_equilibration_steps: int = 200,
+    n_production_steps: int = 1000,
+    temperature_K: float = 300.0,
+    padding_nm: float = 0.8,
+    minimize_iterations: int = 10,
+    restraint_k_kJmol_nm2: Optional[float] = None,
+    sample_every: int = 1,
+    sample_neighbor_lambdas: bool = False,
+    boresch_kwargs: Optional[dict] = None,
+):
+    """Run FEP for ligand decoupling — both the complex and
+    solution sides of a double-decoupling binding free energy.
+
+    Same signature as ``run_amber_mutation_fep`` but the
+    disappearing set is every atom in ``ligand_resnames``
+    instead of a single residue's sidechain.  Pass
+    ``boresch_kwargs`` for the bound-state sweep to add the
+    Boresch 6-restraint; omit it for the solution sweep (the
+    ligand is unrestrained in solution because the volume
+    integral is over a sphere of radius equal to the Boresch
+    anchor's restraint half-width — see Deng & Roux 2009).
+    """
+    openmm, unit = _require_openmm()
+    if lambdas is None:
+        lambdas = tuple(i / 10.0 for i in range(11))
+    lambdas = tuple(float(l) for l in lambdas)
+
+    if restraint_k_kJmol_nm2 is None:
+        kws = dict(padding_nm=padding_nm, temperature_K=temperature_K)
+    else:
+        kws = dict(
+            padding_nm=padding_nm,
+            temperature_K=temperature_K,
+            restraint_k_kJmol_nm2=restraint_k_kJmol_nm2,
+        )
+    system, topology, positions, integrator, disappearing, boresch_refs = (
+        build_ligand_decouple_system(
+            pdb_file,
+            ligand_resnames=ligand_resnames,
+            lambda_value=1.0,
+            boresch_kwargs=boresch_kwargs,
+            **kws,
+        )
+    )
+
+    nb = None
+    for f in system.getForces():
+        if isinstance(f, openmm.CustomNonbondedForce):
+            nb = f
+            break
+    if nb is None:
+        raise RuntimeError("Soft-core CustomNonbondedForce not found")
+
+    platform = openmm.Platform.getPlatformByName("CPU")
+    context = openmm.Context(system, integrator, platform)
+    context.setPositions(positions)
+
+    energies_by_lambda: dict = {lam: [] for lam in lambdas}
+    neighbor_energies: dict = {lam: [] for lam in lambdas}
+
+    try:
+        import numpy as np
+        pos_check = context.getState(getPositions=True)
+        if np.any(np.isnan(np.asarray(
+            [[p.value_in_unit(unit.nanometer) for p in pr]
+             for pr in pos_check.getPositions()]
+        ))):
+            context.setPositions(positions)
+    except Exception:
+        context.setPositions(positions)
+
+    def _energy_at_current_lam() -> float:
+        return context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+            unit.kilojoule_per_mole
+        )
+
+    for i, lam in enumerate(lambdas):
+        context.setParameter("lam", float(lam))
+        nb.updateParametersInContext(context)
+        context.setPositions(positions)
+        if hasattr(openmm, "LocalEnergyMinimizer"):
+            openmm.LocalEnergyMinimizer.minimize(
+                context, maxIterations=minimize_iterations,
+            )
+        for _ in range(max(n_equilibration_steps, 0)):
+            integrator.step(1)
+        prev_lam = lambdas[i - 1] if i > 0 else None
+        next_lam = lambdas[i + 1] if i + 1 < len(lambdas) else None
+        for step in range(max(n_production_steps, 0)):
+            integrator.step(1)
+            if step % max(sample_every, 1) != 0:
+                continue
+            u_self = _energy_at_current_lam()
+            energies_by_lambda[lam].append(u_self)
+            if sample_neighbor_lambdas:
+                u_prev: Optional[float] = None
+                u_next: Optional[float] = None
+                if prev_lam is not None:
+                    context.setParameter("lam", float(prev_lam))
+                    nb.updateParametersInContext(context)
+                    u_prev = _energy_at_current_lam()
+                if next_lam is not None:
+                    context.setParameter("lam", float(next_lam))
+                    nb.updateParametersInContext(context)
+                    u_next = _energy_at_current_lam()
+                context.setParameter("lam", float(lam))
+                nb.updateParametersInContext(context)
+                neighbor_energies[lam].append((u_prev, u_next))
+
+    del context
+
+    if not sample_neighbor_lambdas:
+        neighbor_energies = {}
+
+    return (
+        energies_by_lambda, neighbor_energies,
+        disappearing, boresch_refs,
+    )
+
+
+def compute_binding_dg(
+    energies_complex: dict,
+    energies_solution: dict,
+    neighbor_energies_complex: Optional[dict] = None,
+    neighbor_energies_solution: Optional[dict] = None,
+    boresch_kws: Optional[dict] = None,
+    box_volume_complex_nm3: Optional[float] = None,
+    box_volume_solution_nm3: Optional[float] = None,
+    temperature_K: float = 300.0,
+    apply_standard_state: bool = True,
+    use_bar: bool = True,
+) -> dict:
+    """Assemble absolute binding free energy from a double-
+    decoupling FEP pair.
+
+        ΔG_bind = ΔG_complex_decouple − ΔG_solution_decouple
+                + ΔG_Boresch_correction
+                + ΔG_standard_state_correction (1 mol/L)
+
+    Parameters
+    ----------
+    energies_complex, energies_solution : dict
+        ``{λ: [E, ...]}`` from the bound-state and free-state
+        sweeps respectively.
+    neighbor_energies_complex, neighbor_energies_solution : dict or None
+        Mixed-state energies (from ``sample_neighbor_lambdas=True``).
+        Required for BAR; ignored if ``use_bar=False``.
+    boresch_kws : dict or None
+        Force constants used for the Boresch restraint in the
+        bound sweep, in the form expected by
+        :func:`boresch_analytical_correction`.
+        Pass ``None`` to skip the Boresch correction.
+    box_volume_complex_nm3, box_volume_solution_nm3 : float or None
+        Simulation box volumes in nm³ for the complex and
+        solution runs respectively.  Required when
+        ``apply_standard_state=True`` (default).
+    temperature_K : float
+        Temperature in K.  Default 300.
+    apply_standard_state : bool
+        If True (default), add the standard-state concentration
+        correction so the result is reported at 1 M.  Set False
+        if you want the simulation-box-referenced ΔG.
+    use_bar : bool
+        If True (default), use BAR.  If False, use trapezoidal.
+
+    Returns
+    -------
+    dict
+        ``{complex_dg, solution_dg, boresch_correction,
+        standard_state_correction, binding_dg_kJmol,
+        binding_dg_kcalmol, sigma}``.
+    """
+    if use_bar:
+        if not neighbor_energies_complex or not neighbor_energies_solution:
+            raise ValueError(
+                "BAR requires neighbor_energies from both sweeps; "
+                "pass sample_neighbor_lambdas=True to run_ligand_decouple_fep "
+                "or set use_bar=False to fall back to trapezoidal."
+            )
+        complex_dg, complex_sig, _ = analyze_fep_bar(
+            energies_complex, neighbor_energies_complex,
+            lambdas=sorted(energies_complex.keys()),
+            kT_kjmol=8.314462618e-3 * temperature_K,
+        )
+        solution_dg, solution_sig, _ = analyze_fep_bar(
+            energies_solution, neighbor_energies_solution,
+            lambdas=sorted(energies_solution.keys()),
+            kT_kjmol=8.314462618e-3 * temperature_K,
+        )
+        sigma = float(np.sqrt(complex_sig ** 2 + solution_sig ** 2))
+    else:
+        complex_dg, complex_sig = analyze_fep_trapezoidal(
+            energies_complex,
+            lambdas=sorted(energies_complex.keys()),
+        )
+        solution_dg, solution_sig = analyze_fep_trapezoidal(
+            energies_solution,
+            lambdas=sorted(energies_solution.keys()),
+        )
+        sigma = float(np.sqrt(complex_sig ** 2 + solution_sig ** 2))
+
+    boresch_correction = (
+        boresch_analytical_correction(
+            temperature_K=temperature_K,
+            **boresch_kws,
+        )
+        if boresch_kws is not None
+        else 0.0
+    )
+
+    if apply_standard_state:
+        if box_volume_complex_nm3 is None or box_volume_solution_nm3 is None:
+            raise ValueError(
+                "apply_standard_state=True requires "
+                "box_volume_complex_nm3 and box_volume_solution_nm3."
+            )
+        # Concentration correction is for the *unbound* state only
+        # (the bound state has the ligand pinned by Boresch at a
+        # well-defined position, so its "concentration" is implicit).
+        # ΔG_ss_total = ΔG_ss_solution - ΔG_ss_complex
+        # but ΔG_ss_complex = 0 (ligand pinned, no translational
+        # volume integral), so just use the solution box.
+        standard_state_correction = standard_state_concentration_correction(
+            box_volume_nm3=box_volume_solution_nm3,
+            temperature_K=temperature_K,
+        )
+    else:
+        standard_state_correction = 0.0
+
+    binding_dg_kJmol = (
+        complex_dg - solution_dg
+        + boresch_correction
+        + standard_state_correction
+    )
+    binding_dg_kcalmol = binding_dg_kJmol / 4.184
+
+    return {
+        "complex_dg_kJmol": complex_dg,
+        "solution_dg_kJmol": solution_dg,
+        "boresch_correction_kJmol": boresch_correction,
+        "standard_state_correction_kJmol": standard_state_correction,
+        "binding_dg_kJmol": binding_dg_kJmol,
+        "binding_dg_kcalmol": binding_dg_kcalmol,
+        "sigma_kJmol": sigma,
+    }

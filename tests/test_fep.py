@@ -54,6 +54,11 @@ from protein_studio.core.fep import (  # noqa: E402
     analyze_fep_bar,
     analyze_fep_trapezoidal,
     cartesian_restraint_analytical_correction,
+    boresch_analytical_correction,
+    standard_state_concentration_correction,
+    add_boresch_restraints,
+    compute_binding_dg,
+    _identify_ligand_atoms,
 )
 
 
@@ -766,4 +771,209 @@ def test_cartesian_restraint_correction_phase4_lysine_sign_and_magnitude():
         f"Phase 4 Lys6 correction {corr:.3f} kJ/mol exceeds "
         "expected bound (restraints shouldn't bias the "
         "estimate by more than 10% of the alchemical ΔG)"
+    )
+
+
+# ----- Phase 5: protein-ligand binding FEP --------------------------------
+
+
+def test_boresch_analytical_correction_typical():
+    """Standard Boresch (2003) values: k_r=10 kcal/mol/Å²,
+    k_θ=100 kcal/mol/rad², k_φ=1000 kcal/mol/rad², T=300 K.
+    Reference: −25.3 kJ/mol (≈ −6 kcal/mol).  Sign is
+    negative because unrestraining the ligand into the
+    standard state DECREASES its free energy — the restraints
+    were biasing the bound state in the wrong direction.
+    """
+    corr = boresch_analytical_correction(
+        k_r_kJmol_nm2=41.84,        # 10 kcal/mol/Å²
+        k_theta1_kJmol_rad2=418.4, # 100 kcal/mol/rad²
+        k_theta2_kJmol_rad2=418.4,
+        k_phi1_kJmol_rad2=4184.0,  # 1000 kcal/mol/rad²
+        k_phi2_kJmol_rad2=4184.0,
+        k_phi3_kJmol_rad2=4184.0,
+        temperature_K=300.0,
+    )
+    assert -27 < corr < -23, (
+        f"expected ~-25 kJ/mol, got {corr:.3f}"
+    )
+
+
+def test_boresch_analytical_correction_stiffer_k_larger_magnitude():
+    """Tighter restraints (larger k) → larger |ΔG_correction|.
+    The more the restraints constrain the ligand, the more
+    entropy it gains upon unrestraining.
+    """
+    corr_loose = boresch_analytical_correction(
+        k_r_kJmol_nm2=4.184, k_theta1_kJmol_rad2=41.84,
+        k_theta2_kJmol_rad2=41.84,
+        k_phi1_kJmol_rad2=418.4, k_phi2_kJmol_rad2=418.4,
+        k_phi3_kJmol_rad2=418.4,
+    )
+    corr_tight = boresch_analytical_correction(
+        k_r_kJmol_nm2=418.4, k_theta1_kJmol_rad2=4184.0,
+        k_theta2_kJmol_rad2=4184.0,
+        k_phi1_kJmol_rad2=41840.0, k_phi2_kJmol_rad2=41840.0,
+        k_phi3_kJmol_rad2=41840.0,
+    )
+    assert abs(corr_tight) > abs(corr_loose), (
+        f"tighter restraints → larger |corr|: "
+        f"loose={corr_loose:.3f}, tight={corr_tight:.3f}"
+    )
+
+
+def test_boresch_analytical_correction_zero_forces_raises():
+    """Zero force constants → the formula breaks down
+    (division by zero in the Z_restrained denominator).
+    Physically: with zero restraints there's no restoring
+    potential so the ligand would sample unbounded rotational
+    space — the standard-state / restraint partition-function
+    comparison isn't well-defined.  The function raises a
+    ZeroDivisionError rather than silently returning garbage.
+    """
+    with pytest.raises(ZeroDivisionError):
+        boresch_analytical_correction(
+            k_r_kJmol_nm2=0.0, k_theta1_kJmol_rad2=418.4,
+            k_theta2_kJmol_rad2=418.4,
+            k_phi1_kJmol_rad2=4184.0, k_phi2_kJmol_rad2=4184.0,
+            k_phi3_kJmol_rad2=4184.0,
+        )
+
+
+def test_standard_state_concentration_correction_typical_box():
+    """For a 1ubq-like box (V ≈ 440 nm³) at T = 300 K,
+    ΔG_ss ≈ −3.3 kJ/mol.  The simulation box has higher
+    effective ligand concentration than 1 M, so reporting at
+    1 M makes binding slightly less favourable.
+    """
+    corr = standard_state_concentration_correction(
+        box_volume_nm3=440.0, temperature_K=300.0,
+    )
+    assert -5 < corr < -1, (
+        f"expected ~-3.3 kJ/mol for 440 nm³ box, got {corr:.3f}"
+    )
+
+
+def test_standard_state_concentration_correction_scales_with_volume():
+    """Larger box (more dilute ligand) → more negative
+    ΔG_ss (since log(V_box) increases)."""
+    c_small = standard_state_concentration_correction(box_volume_nm3=100.0)
+    c_large = standard_state_concentration_correction(box_volume_nm3=1000.0)
+    assert c_large > c_small, (
+        f"larger box → larger ΔG_ss: small={c_small:.3f}, large={c_large:.3f}"
+    )
+
+
+def test_standard_state_concentration_correction_temperature():
+    """Doubling T doubles ΔG_ss (linear in kT)."""
+    c_300 = standard_state_concentration_correction(box_volume_nm3=440.0, temperature_K=300.0)
+    c_600 = standard_state_concentration_correction(box_volume_nm3=440.0, temperature_K=600.0)
+    assert abs(c_600 / c_300 - 2.0) < 1e-10
+
+
+def test_compute_binding_dg_assembly_with_synthetic_data():
+    """End-to-end assembly test on synthetic energies.
+    ΔG_complex_decouple = 20 (decoupling ligand in complex costs
+    energy because it was stabilised).  ΔG_solution_decouple =
+    10 (decoupling free ligand costs less).  Without any
+    corrections, ΔG_bind = ΔG_complex − ΔG_solution = +10.
+    Add Boresch correction (≈ -25) → ΔG_bind ≈ -15.
+    Add standard-state correction (≈ -3) → ΔG_bind ≈ -18.
+    """
+    rng = np.random.default_rng(0)
+    e_c = {0.0: list(rng.normal(0, 1, 100)),
+           0.5: list(rng.normal(20, 1, 100)),
+           1.0: list(rng.normal(40, 1, 100))}
+    e_s = {0.0: list(rng.normal(0, 1, 100)),
+           0.5: list(rng.normal(10, 1, 100)),
+           1.0: list(rng.normal(20, 1, 100))}
+
+    # Without standard state and Boresch
+    res = compute_binding_dg(
+        e_c, e_s, use_bar=False, apply_standard_state=False,
+    )
+    assert abs(res["binding_dg_kJmol"] - 10.0) < 1.0
+    assert res["standard_state_correction_kJmol"] == 0.0
+    assert res["boresch_correction_kJmol"] == 0.0
+
+    # With Boresch only
+    res = compute_binding_dg(
+        e_c, e_s, use_bar=False, apply_standard_state=False,
+        boresch_kws={
+            "k_r_kJmol_nm2": 41.84,
+            "k_theta1_kJmol_rad2": 418.4,
+            "k_theta2_kJmol_rad2": 418.4,
+            "k_phi1_kJmol_rad2": 4184.0,
+            "k_phi2_kJmol_rad2": 4184.0,
+            "k_phi3_kJmol_rad2": 4184.0,
+        },
+    )
+    assert abs(res["binding_dg_kJmol"] - (10.0 - 25.25)) < 1.0, (
+        f"expected ~-15.25 with Boresch only, got {res['binding_dg_kJmol']:.3f}"
+    )
+
+    # With both Boresch and standard state
+    res = compute_binding_dg(
+        e_c, e_s, use_bar=False,
+        boresch_kws={
+            "k_r_kJmol_nm2": 41.84,
+            "k_theta1_kJmol_rad2": 418.4,
+            "k_theta2_kJmol_rad2": 418.4,
+            "k_phi1_kJmol_rad2": 4184.0,
+            "k_phi2_kJmol_rad2": 4184.0,
+            "k_phi3_kJmol_rad2": 4184.0,
+        },
+        box_volume_complex_nm3=440.0,
+        box_volume_solution_nm3=440.0,
+    )
+    expected = 10.0 - 25.25 + (-3.31)
+    assert abs(res["binding_dg_kJmol"] - expected) < 1.0, (
+        f"expected ~{expected:.3f} with both corrections, "
+        f"got {res['binding_dg_kJmol']:.3f}"
+    )
+
+
+def test_compute_binding_dg_requires_box_volumes_for_standard_state():
+    """apply_standard_state=True without box volumes should
+    raise — without box info we can't compute the correction."""
+    rng = np.random.default_rng(0)
+    e_c = {0.0: list(rng.normal(0, 1, 50)), 1.0: list(rng.normal(40, 1, 50))}
+    e_s = {0.0: list(rng.normal(0, 1, 50)), 1.0: list(rng.normal(20, 1, 50))}
+    with pytest.raises(ValueError, match="box_volume"):
+        compute_binding_dg(
+            e_c, e_s, use_bar=False,
+            # apply_standard_state defaults to True
+        )
+
+
+def test_compute_binding_dg_requires_neighbor_energies_for_bar():
+    """use_bar=True without neighbor energies should raise."""
+    rng = np.random.default_rng(0)
+    e_c = {0.0: list(rng.normal(0, 1, 50)), 1.0: list(rng.normal(40, 1, 50))}
+    e_s = {0.0: list(rng.normal(0, 1, 50)), 1.0: list(rng.normal(20, 1, 50))}
+    with pytest.raises(ValueError, match="neighbor_energies"):
+        compute_binding_dg(e_c, e_s, use_bar=True)
+
+
+@pytest.mark.slow
+def test_identify_ligand_atoms_finds_ligand_resname():
+    """In 1ubq, the only non-standard HETATM residue is
+    water (HOH).  After addHydrogens, HOH is still HOH.  So
+    asking for ligand_resnames=['HOH'] should return all
+    water atoms (the wrong target — there is no ligand — but
+    the identification logic should work)."""
+    import openmm.app as app
+    import openmm
+
+    # Build the same way build_amber_mutation_system does.
+    from protein_studio.core.fep import build_amber_solvated_system
+    sys_, topo, _, _ = build_amber_solvated_system(ONEUBQ, padding_nm=0.8)
+    # No ligand in 1ubq (no HETATM except water + ions).  So
+    # asking for ["XYZ"] should return empty.
+    assert _identify_ligand_atoms(topo, ["XYZ"]) == []
+    # Asking for HOH (water) should return many atoms (the
+    # TIP3P waters added by addSolvent).
+    hoh_atoms = _identify_ligand_atoms(topo, ["HOH"])
+    assert len(hoh_atoms) > 1000, (
+        f"expected many HOH atoms, got {len(hoh_atoms)}"
     )
