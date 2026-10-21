@@ -138,18 +138,35 @@ class ViewportWidget(QWidget):
         try:
             from pyvistaqt import QtInteractor
             self.plotter = QtInteractor(self)
-        except Exception:
+        except Exception as _exc:
             # Fallback: PyVista's background plotter (still works without Qt event loop)
             import pyvista as pv
             self.plotter = pv.Plotter()
             placeholder = QLabel(
-                "pyvistaqt is not available — falling back to offscreen rendering"
+                "<b>pyvistaqt is not available</b> — falling back to "
+                "offscreen rendering.<br><br>"
+                "This usually means the GUI was started with a Python "
+                "interpreter that doesn't have pyvistaqt installed "
+                "(typically the system python3 in /usr/bin, while "
+                "pyvistaqt is in your protein-studio conda env).<br><br>"
+                "Fix: launch with the conda env's python:<br>"
+                "<code>/opt/homebrew/Caskroom/miniconda/base/envs/"
+                "protein-studio/bin/python -m protein_studio</code>"
+                f"<br><br>Underlying error: {_exc}"
             )
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            placeholder.setWordWrap(True)
             layout.addWidget(placeholder, 1)
 
         if hasattr(self.plotter, "set_background"):
-            self.plotter.set_background("#333333", top="#222222")
+            # Bottom: 0.07, top: 0.04 — substantially darker than the
+            # CPK carbon color (0.20) so dark-gray carbon atoms stay
+            # visible against the background instead of blending into
+            # it.  Anything lighter than ~0.13 will let a methane /
+            # ethyl / methyl group's central carbon become invisible
+            # against the bg, which makes a "ball-and-stick" molecule
+            # look like just the hydrogens.
+            self.plotter.set_background("#111111", top="#0a0a0a")
 
         # Enable SSAO (screen-space ambient occlusion) for depth cues
         # between closely packed atoms.

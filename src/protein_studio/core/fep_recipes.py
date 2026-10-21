@@ -31,7 +31,9 @@ def _recipe(
     sample_every: int,
     sample_neighbor_lambdas: bool,
     restraint_k_kJmol_nm2: float,
-    description: str,
+    minimize_iterations: int = 100,
+    minimize_tolerance_kJmol: float = 10.0,
+    description: str = "",
 ) -> Dict[str, Any]:
     return {
         "name": name,
@@ -41,6 +43,8 @@ def _recipe(
         "sample_every": sample_every,
         "sample_neighbor_lambdas": sample_neighbor_lambdas,
         "restraint_k_kJmol_nm2": restraint_k_kJmol_nm2,
+        "minimize_iterations": minimize_iterations,
+        "minimize_tolerance_kJmol": minimize_tolerance_kJmol,
         "description": description,
     }
 

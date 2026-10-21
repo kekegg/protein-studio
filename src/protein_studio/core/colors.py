@@ -73,8 +73,13 @@ THREE_TO_ONE = {
     "SEC": "U", "PYL": "O",
 }
 
-# Default scene background (Blender-style dark gray)
-DEFAULT_BG = (0.20, 0.20, 0.20)
+# Default scene background (Blender-style dark gray).
+# Picked darker than the CPK carbon color (0.20) so dark-gray carbon
+# atoms are visible against the background instead of blending into it.
+# Anything lighter than ~0.10 makes a methane / methyl / ethyl group's
+# central carbon invisible against the bg, which makes a "ball-and-stick"
+# molecule look like just the hydrogens.
+DEFAULT_BG = (0.07, 0.07, 0.07)
 DEFAULT_FG = (0.85, 0.85, 0.85)
 
 

@@ -14,9 +14,10 @@ The panel is the GUI front-end for those tools, nothing more.
 from __future__ import annotations
 
 import traceback
+from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QObject, QThread, Signal
+from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QDockWidget,
@@ -150,6 +151,14 @@ class FEPPanel(QWidget):
         self._thread: Optional[QThread] = None
         self._worker: Optional[FEPRunWorker] = None
         self._api = None  # StudioAPI handle; set by FEPDockWidget.set_api
+        # Debounce timer for PDB-path changes — waits 300 ms of silence
+        # before clearing the viewport + loading the new file.  Stops the
+        # scene from flickering as the user types the path character by
+        # character, and from going blank if they edit in the middle.
+        self._pdb_load_timer = QTimer(self)
+        self._pdb_load_timer.setSingleShot(True)
+        self._pdb_load_timer.setInterval(300)
+        self._pdb_load_timer.timeout.connect(self._apply_pdb_path)
         self._build_ui()
         self._on_mode_changed("mutation")
         self._on_recipe_changed("quick_test")
@@ -166,6 +175,12 @@ class FEPPanel(QWidget):
         # PDB file picker
         self._pdb_edit = QLineEdit()
         self._pdb_edit.setPlaceholderText("Absolute path to a .pdb file")
+        # Whenever the path changes (browse or manual edit) clear the
+        # viewport and load the new PDB. The user wants the FEP dock
+        # to be the "single source of truth" for which structure is on
+        # screen, so loading another FEP target always replaces the
+        # current scene.
+        self._pdb_edit.textChanged.connect(self._on_pdb_path_changed)
         pdb_browse = QPushButton("Browse…")
         pdb_browse.clicked.connect(self._on_pdb_browse)
         pdb_row = QHBoxLayout()
@@ -310,6 +325,65 @@ class FEPPanel(QWidget):
         )
         if path:
             self._pdb_edit.setText(path)
+
+    def _on_pdb_path_changed(self, path: str) -> None:
+        """Restart the debounce timer on every keystroke / Browse.
+
+        The actual clear + load happens in :meth:`_apply_pdb_path`
+        after 300 ms of silence so partial-typed paths don't blank
+        the viewport mid-edit.  Browse also routes through here
+        (``_pdb_edit.setText`` emits ``textChanged``), so both the
+        picker and manual typing share the same debounced path.
+        """
+        # Don't bother restarting the timer if the user cleared the
+        # field entirely — there's no work to do.
+        if not (path or "").strip():
+            self._pdb_load_timer.stop()
+            return
+        self._pdb_load_timer.start()
+
+    def _apply_pdb_path(self) -> None:
+        """Clear the viewport and load the selected PDB.
+
+        Runs 300 ms after the last ``textChanged`` so typing a path
+        doesn't flash the scene empty mid-keystroke.  We still
+        validate the path here (a partial path may have looked
+        plausible when ``textChanged`` fired).
+        """
+        # Read the current text from the line edit — the QTimer.timeout
+        # signal has no arguments, so we can't receive the path
+        # directly.  Reading from the widget gives us the latest value.
+        path = self._pdb_edit.text().strip()
+        if not path:
+            return
+        if not Path(path).is_file():
+            return
+        if self._api is None:
+            return
+        try:
+            self._api.clear()
+            # Let SceneAPI.load() auto-pick the rep/scheme based on
+            # molecule type — proteins get cartoon + secondary;
+            # pure-hetero (methane, ligand, single residue) get
+            # ball_and_stick + element (CPK).
+            obj = self._api.load(path)
+            self._status_label_widget().setText(
+                f"Loaded {obj.name} ({obj.molecule.n_atoms()} atoms, "
+                f"rep={obj.representation})"
+            )
+        except Exception as e:
+            self._status_label_widget().setText(
+                f"⚠ Could not load PDB: {type(e).__name__}: {e}"
+            )
+
+    def _status_label_widget(self):
+        """Return the (mutable) status label for transient feedback.
+
+        We re-use the build-result label since it's already in the
+        layout and visible to the user. If the panel ever grows a
+        dedicated status row, swap this for the new widget.
+        """
+        return self._build_result
 
     def _on_mode_changed(self, mode: str) -> None:
         self._mutation_edit.setVisible(mode == "mutation")

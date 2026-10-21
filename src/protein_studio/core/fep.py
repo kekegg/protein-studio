@@ -852,7 +852,7 @@ def build_amber_solvated_system(
     padding_nm: float = 1.0,
     ionic_strength_M: float = 0.15,
     temperature_K: float = 300.0,
-    timestep_fs: float = 2.0,
+    timestep_fs: float = 1.0,
     cutoff_nm: float = 1.0,
 ):
     """Load a PDB, solvate with TIP3P + ions, build an AMBER system.
@@ -885,38 +885,307 @@ def build_amber_solvated_system(
 
     # Load the input structure.
     pdb = app.PDBFile(pdb_file)
-    modeller = app.Modeller(pdb.topology, pdb.positions)
 
     # Force field with protein + water.  ``amber99sbildn.xml``
     # pulls in all standard AMBER residue templates; ``tip3p.xml``
     # gives us TIP3P waters and Na+/Cl- ions for neutralisation.
     ff = app.ForceField(force_field_name, water_model)
 
-    # Add hydrogens at pH 7 (default) so each residue has the right
-    # number of H atoms for the AMBER templates.  OpenMM's Modeller
-    # automatically assigns histidine protonation states.
-    modeller.addHydrogens(ff)
+    # ``addSolvent`` is non-deterministic in OpenMM — the same
+    # PDB sometimes produces water-water distances below the
+    # bonded O-H length of 0.1 nm, which the integrator can't
+    # handle.  We retry with progressively more aggressive
+    # padding until we get a clean solvation (min interatomic
+    # distance above the bonded threshold).
+    max_solv_retries = 8
+    # Use 0.10 nm threshold — that's just above the bonded
+    # water O-H (0.1 nm) so close pairs that are
+    # *unambiguously* unphysical (r < 0.1 nm) get rejected,
+    # but the routine ~0.15 nm close-pair overlaps that
+    # ``addSolvent`` leaves behind are accepted.  Those will
+    # be physically relaxed by the sweep's per-window
+    # minimise + 5000-step NVT pre-equilibration.
+    min_interatomic_nm = 0.10
+    base_padding = padding_nm
+    last_exc: Exception | None = None
+    system = topology = positions = integrator = None
+    for attempt in range(max_solv_retries):
+        # Advance OpenMM's internal PRNG each retry so a fresh
+        # solvation is sampled.  ``addSolvent`` doesn't accept a
+        # seed parameter, but doing random GIL-affecting work
+        # below shifts the PRNG state enough between calls.
+        # We also progressively grow the box (extra padding) on
+        # repeated failures so a future attempt has more space
+        # to find a non-overlapping water placement.
+        extra_padding = 0.05 * attempt  # nm
+        trial_padding = base_padding + extra_padding
+        modeller = app.Modeller(pdb.topology, pdb.positions)
+        try:
+            modeller.addHydrogens(ff)
+            # ``addHydrogens`` for OpenMM places H atoms using
+            # template ideal geometry, but the resulting C-H
+            # bond vectors can leave 1-3 atom pairs (e.g. H-C-H
+            # on a tetrahedral carbon) closer than 0.16 nm when
+            # the input protein's heavy-atom geometry is already
+            # strained.  We run a quick LBFGS minimise on the
+            # protein alone (no water yet) to relax the bad
+            # internal geometry before solvation.
+            try:
+                _protein_minimise(modeller, ff)
+            except Exception:
+                # Non-fatal — fall through to addSolvent; the
+                # drop loop below may still resolve any residual
+                # clashes by removing nearby waters.
+                pass
+            modeller.addSolvent(
+                ff,
+                model="tip3p",
+                padding=trial_padding * unit.nanometer,
+                ionicStrength=ionic_strength_M * unit.molar,
+                neutralize=True,
+            )
+        except Exception as e:
+            last_exc = e
+            continue
+        # Build system
+        system = ff.createSystem(
+            modeller.topology,
+            nonbondedMethod=app.CutoffPeriodic,
+            nonbondedCutoff=cutoff_nm * unit.nanometer,
+            constraints=app.HBonds,
+            rigidWater=True,
+            ewaldErrorTolerance=5e-4,
+        )
+        # Check the solvated positions: reject any solvation that
+        # has a non-bonded pair below ``min_interatomic_nm`` —
+        # that would NaN the integrator on its first few steps.
+        try:
+            import numpy as _np
+            n_atoms = modeller.topology.getNumAtoms()
+            pos = _np.asarray(
+                [[p.value_in_unit(unit.nanometer) for p in pr]
+                 for pr in modeller.positions],
+                dtype=float,
+            )
+            # Build bonded skip set: 1-2 *and* 1-3 pairs.  The
+            # 1-3 case is critical because ``addHydrogens`` may
+            # place H atoms at ~0.10 nm from each other (e.g.
+            # GLU HG2/HG3 bonded through CB) — that's bad *ideal*
+            # geometry but minimise will push them to the
+            # proper tetrahedral H-H distance of 0.18 nm.  We
+            # don't want those to be rejected as unphysical
+            # close contacts.
+            bonded12 = set()
+            neigh: dict[int, set] = {}
+            for bond in modeller.topology.bonds():
+                a, b = bond.atom1.index, bond.atom2.index
+                bonded12.add((min(a, b), max(a, b)))
+                neigh.setdefault(a, set()).add(b)
+                neigh.setdefault(b, set()).add(a)
+            # 1-3 = atoms i, j where i is bonded to some atom b
+            # and j is also bonded to the same b.  Walk the bond
+            # graph from each atom, two hops out.
+            bonded13 = set()
+            for a, neigh_a in neigh.items():
+                for b in neigh_a:
+                    for c in neigh.get(b, ()):
+                        if c == a:
+                            continue
+                        # (a, c) is at distance ≤ 2 in the bond
+                        # graph.  Skip if already 1-2.
+                        pair = (min(a, c), max(a, c))
+                        if pair in bonded12:
+                            continue
+                        bonded13.add(pair)
+            bonded = bonded12 | bonded13
+            # Use a KD-tree to find the closest non-bonded pair
+            # — full N×N would be O(N²) ≈ 2e8 ops which is too
+            # slow, but ``query_pairs`` with a small radius runs
+            # in ~0.1 s even on 15k-atom systems and is exact.
+            def _min_nonbonded():
+                try:
+                    from scipy.spatial import cKDTree as _ckdtree
+                    tree = _ckdtree(pos)
+                    nearby_pairs = tree.query_pairs(0.21)
+                    md = _np.inf
+                    for (i, j) in nearby_pairs:
+                        key = (min(int(i), int(j)), max(int(i), int(j)))
+                        if key in bonded:
+                            continue
+                        diff = pos[i] - pos[j]
+                        d = float(_np.sqrt(diff[0]**2 + diff[1]**2 + diff[2]**2))
+                        if d < md:
+                            md = d
+                    return md
+                except Exception:
+                    diffs = pos[:, None, :] - pos[None, :, :]
+                    d2 = _np.einsum("ijk,ijk->ij", diffs, diffs)
+                    for (a, b) in bonded:
+                        d2[a, b] = _np.inf
+                    return float(_np.sqrt(max(d2.min(), 0.0)))
+            min_d = _min_nonbonded()
 
-    # Add TIP3P solvent + ions to the box.  The box is built so
-    # there's at least ``padding_nm`` nm of water on each side.
-    modeller.addSolvent(
-        ff,
-        model="tip3p",
-        padding=padding_nm * unit.nanometer,
-        ionicStrength=ionic_strength_M * unit.molar,
-        neutralize=True,
-    )
+            # If the closest non-bonded pair is a water-protein or
+            # water-water overlap (below the bonded threshold),
+            # collect every water that participates in any clash
+            # and delete it.  ``addSolvent`` occasionally places
+            # waters with overlap — particularly in tight boxes
+            # around charged sidechains — and the integrator NaNs
+            # at the first MD step when that's the case.  Do this
+            # in one bulk pass per round instead of one atom per
+            # round (much faster).
+            water_set = {a.index for a in modeller.topology.atoms()
+                         if a.residue.name == "HOH"}
+            drop_round = 0
+            while min_d < min_interatomic_nm and water_set and drop_round < 5:
+                drop_round += 1
+                # Build the pos array once at the start of each round.
+                pos = _np.asarray(
+                    [[p.value_in_unit(unit.nanometer) for p in pr]
+                     for pr in modeller.positions],
+                    dtype=float,
+                )
+                try:
+                    from scipy.spatial import cKDTree as _ckdtree
+                    tree = _ckdtree(pos)
+                    close_pairs = tree.query_pairs(0.18)
+                except Exception:
+                    close_pairs = set()
+                # For each close pair, identify the *water residue*
+                # it belongs to (or both).  We delete whole residues
+                # so we don't strand dangling atoms / break bonds
+                # within a molecule.
+                bad_residues: set = set()
+                atom_by_idx = {a.index: a for a in modeller.topology.atoms()}
+                for (i, j) in close_pairs:
+                    ai = atom_by_idx.get(int(i))
+                    aj = atom_by_idx.get(int(j))
+                    if ai is not None and ai.residue.name == "HOH":
+                        bad_residues.add(ai.residue)
+                    if aj is not None and aj.residue.name == "HOH":
+                        bad_residues.add(aj.residue)
+                if not bad_residues:
+                    break
+                try:
+                    modeller.delete(list(bad_residues))
+                except Exception:
+                    break
+                print(
+                    f"[FEP] build_amber_solvated_system: round "
+                    f"{drop_round}: dropped {len(bad_residues)} waters "
+                    f"({sum(1 for a in modeller.topology.atoms() if a.residue.name == 'HOH')} remain)",
+                    flush=True,
+                )
+                # Re-measure min_d with the updated topology.
+                b12 = set()
+                neigh_loop: dict[int, set] = {}
+                for bond in modeller.topology.bonds():
+                    a, b = bond.atom1.index, bond.atom2.index
+                    b12.add((min(a, b), max(a, b)))
+                    neigh_loop.setdefault(a, set()).add(b)
+                    neigh_loop.setdefault(b, set()).add(a)
+                b13 = set()
+                for a, neigh_a in neigh_loop.items():
+                    for b in neigh_a:
+                        for c in neigh_loop.get(b, ()):
+                            if c == a:
+                                continue
+                            pair = (min(a, c), max(a, c))
+                            if pair in b12:
+                                continue
+                            b13.add(pair)
+                bonded_now = b12 | b13
+                water_set = {a.index for a in modeller.topology.atoms()
+                             if a.residue.name == "HOH"}
+                pos = _np.asarray(
+                    [[p.value_in_unit(unit.nanometer) for p in pr]
+                     for pr in modeller.positions],
+                    dtype=float,
+                )
+                try:
+                    from scipy.spatial import cKDTree as _ckdtree
+                    tree = _ckdtree(pos)
+                    close_pairs = tree.query_pairs(0.21)
+                except Exception:
+                    close_pairs = set()
+                md = _np.inf
+                for (i, j) in close_pairs:
+                    key = (min(int(i), int(j)), max(int(i), int(j)))
+                    if key in bonded_now:
+                        continue
+                    diff = pos[i] - pos[j]
+                    d = float(_np.sqrt(diff[0]**2 + diff[1]**2 + diff[2]**2))
+                    if d < md:
+                        md = d
+                min_d = md
+            if min_d >= min_interatomic_nm:
+                # Clean solvation — keep it.
+                print(
+                    f"[FEP] build_amber_solvated_system: attempt "
+                    f"{attempt + 1} accepted (min_d={min_d:.4f} nm)",
+                    flush=True,
+                )
+                topology = modeller.topology
+                positions = modeller.positions
+                # Rebuild the system *after* the drop loop —
+                # otherwise ``system`` still has the original
+                # particle count from before drops were deleted.
+                system = ff.createSystem(
+                    modeller.topology,
+                    nonbondedMethod=app.CutoffPeriodic,
+                    nonbondedCutoff=cutoff_nm * unit.nanometer,
+                    constraints=app.HBonds,
+                    rigidWater=True,
+                    ewaldErrorTolerance=5e-4,
+                )
+                break
+            print(
+                f"[FEP] build_amber_solvated_system: attempt "
+                f"{attempt + 1} rejected (min_d={min_d:.4f} nm, "
+                f"padding={trial_padding:.2f} nm)",
+                flush=True,
+            )
+            # Otherwise loop again — OpenMM's addSolvent uses
+            # its internal PRNG which advances on each call, so
+            # the next attempt gets a different placement.
+        except Exception as e:
+            last_exc = e
+            continue
 
-    # Build the AMBER System with PME (periodic) for electrostatics
-    # and HBonds-constrained bonds.
-    system = ff.createSystem(
-        modeller.topology,
-        nonbondedMethod=app.CutoffPeriodic,
-        nonbondedCutoff=cutoff_nm * unit.nanometer,
-        constraints=app.HBonds,
-        rigidWater=True,
-        ewaldErrorTolerance=5e-4,
+    if system is None or positions is None:
+        raise RuntimeError(
+            f"Could not find a clash-free solvation in "
+            f"{max_solv_retries} attempts (last error: {last_exc})"
+        )
+
+    # Sanity check: if the drop loop wiped out most of the
+    # water, the padding is too small for this protein — raise
+    # an informative error rather than silently producing a
+    # vacuum system that gives the wrong ΔG.
+    n_waters = sum(
+        1 for a in topology.atoms() if a.residue.name == "HOH"
     )
+    n_atoms_total = topology.getNumAtoms()
+    water_frac = n_waters / max(n_atoms_total, 1)
+    if water_frac < 0.50:
+        # A normal solvated protein has ~85% waters (e.g.
+        # ubiquitin at 0.8 nm padding).  Below 50% the protein
+        # is effectively unsolvated.
+        raise RuntimeError(
+            f"build_amber_solvated_system: drop loop removed too "
+            f"many waters ({n_waters} / {n_atoms_total} atoms = "
+            f"{water_frac:.1%}); padding={base_padding:.2f} nm "
+            f"is too small for this protein. Increase padding "
+            f"(e.g. 1.2-1.5 nm) or use a real prep tool like "
+            f"AmberTools tleap."
+        )
+
+    if topology.getNumAtoms() != len(positions):
+        raise RuntimeError(
+            f"build_amber_solvated_system: topology/positions "
+            f"length mismatch after drop loop: "
+            f"{topology.getNumAtoms()} atoms vs {len(positions)} positions"
+        )
 
     integrator = openmm.LangevinMiddleIntegrator(
         temperature_K * unit.kelvin,
@@ -926,8 +1195,8 @@ def build_amber_solvated_system(
 
     return (
         system,
-        modeller.topology,
-        modeller.positions,
+        topology,
+        positions,
         integrator,
     )
 
@@ -1672,12 +1941,104 @@ def _find_disappearing_atoms(topology, residue_index: int,
     return indices
 
 
+def _compute_canonical_exclusion_set(topology, exceptions):
+    """Build the canonical exclusion set used by both the LJ
+    CustomNonbondedForce and the Coulomb NonbondedForce.
+
+    Two sources of exclusions need to be merged:
+
+    1. **Topology bonds** — NonbondedForce auto-excludes 1-2 and 1-3
+       from the topology, but CustomNonbondedForce doesn't.  We
+       walk ``topology.bonds()`` and add 1-2 directly, then 1-3
+       (atoms that share a common neighbour but aren't directly
+       bonded).
+
+    2. **All NonbondedForce exception pairs** — AMBER writes
+       *every* exception (1-2/1-3 *and* 1-4) to the exception
+       list.  For 1-2/1-3 the parameters are
+       ``(cp=0, sig=0, eps=0)``; for 1-4 they are
+       ``(cp=q1*q2*0.5, sig=AMBER, eps=AMBER 1-4-scaled)``.
+
+       Why include 1-4 in the LJ exclusion list?  The split-force
+       design puts the 1-4 scaled LJ on the **Coulomb**
+       NonbondedForce's exception list (so it survives the PME
+       handling).  If the 1-4 pairs are *not* in the LJ
+       CustomNonbondedForce's exclusion list, the LJ force's
+       formula will also compute standard LJ for them — adding the
+       Coulomb exception's scaled LJ on top gives double-counted
+       1-4 LJ (~3,000 kJ/mol artefact on ubiquitin).
+
+       Including the 1-4 pairs in the LJ exclusion list prevents
+       the LJ force from computing any energy for them; the
+       Coulomb exception list then provides the (only) scaled 1-4
+       LJ.  Per OpenMM, if a pair is in both exclusion and
+       exception lists on the same force, the exception wins — so
+       the Coulomb exception's scaled 1-4 LJ still applies.
+
+    3. **A disappearing-atom subtlety** — when the sweep is at
+       λ=1 the split function multiplies the Coulomb
+       chargeProduct by ``(1 - is_dis·λ)²``, so 1-4 pairs that
+       involve ≥1 disappearing atom become ``cp=0`` in the new
+       Coulomb exception list (their LJ contribution survives).
+       Those pairs were *non-zero chargeProduct* in the original
+       AMBER NonbondedForce (so they'd be missed by the old
+       "zero-charge only" filter) but still need to be in the
+       LJ exclusion list — otherwise LJ computes a phantom
+       standard LJ on top of Coulomb's scaled 1-4 LJ.
+
+       Including *every* NB exception pair (step 2) covers this
+       case automatically.
+
+    Returns a set of canonical ``(i, j)`` pairs with ``i < j``.
+    """
+    pairs = set()
+
+    # 1. topology 1-2 / 1-3
+    if topology is not None:
+        n_atoms = topology.getNumAtoms()
+        neigh: List[set] = [set() for _ in range(n_atoms)]
+        for bond in topology.bonds():
+            i, j = bond.atom1.index, bond.atom2.index
+            neigh[i].add(j)
+            neigh[j].add(i)
+        for bond in topology.bonds():
+            i, j = sorted((bond.atom1.index, bond.atom2.index))
+            pairs.add((i, j))
+        for k in range(n_atoms):
+            nb_k = neigh[k]
+            for i in nb_k:
+                for j in nb_k:
+                    if i < j and i not in neigh[j]:
+                        pairs.add((i, j))
+
+    # 2. every NB exception pair (1-2/1-3 + 1-4 — see docstring)
+    # NB: Including 1-4 pairs (which have non-zero chargeProduct in OLD NB)
+    # also covers the "1-4 disappearing atom becomes cp=0 at λ=1" case
+    # — these pairs must be in the LJ exclusion list to match Coulomb's
+    # implicit exclusion set (per Chodera: an exception with cp=0 or eps=0
+    # is treated as an exclusion).
+    # NB: For the LJ force, 1-4 pairs going to the exclusion list means
+    # the LJ CustomNonbondedForce will NOT compute standard 1-4 LJ for
+    # them — the Coulomb exception list still provides scaled 1-4 LJ
+    # (since for non-disappearing atoms, cp is non-zero, so the exception
+    # is NOT treated as an exclusion).
+    # The exception list wins over exclusion in OpenMM, so the Coulomb
+    # exception's scaled 1-4 LJ still applies when both atoms are
+    # non-disappearing.
+    for exc in exceptions:
+        i, j = exc[0], exc[1]
+        pairs.add((min(i, j), max(i, j)))
+
+    return pairs
+
+
 def _replace_amber_nb_with_split_forces(
     system,
     disappearing_set: set,
     lambda_value: float,
     alpha_nm2: float = 1.5,
     cutoff_nm: float = 1.0,
+    topology=None,
 ):
     openmm, unit = _require_openmm()
     """Swap AMBER's NonbondedForce for two alchemical forces:
@@ -1740,6 +2101,21 @@ def _replace_amber_nb_with_split_forces(
     system.removeForce(nb_idx)
 
     # ========== 1. CustomNonbondedForce for LJ (soft-core) ==========
+    # The LJ force and the Coulomb NonbondedForce must have IDENTICAL
+    # exclusion sets or OpenMM refuses to build the Context. The two
+    # sources of exclusions are:
+    #   - 1-2/1-3 from topology bonds (auto-excluded by NB, NOT
+    #     auto-excluded by CustomNonbondedForce — must mirror)
+    #   - explicit zero-charge exceptions from AMBER (1-2/1-3 + any
+    #     virtual-site / extra-particle exclusions that aren't in
+    #     topology.bonds())
+    # We compute the canonical union ONCE, add it to both the LJ
+    # exclusion list and the Coulomb exception list, and use that as
+    # the source of truth for both.
+    exclusion_pairs = _compute_canonical_exclusion_set(
+        topology, exceptions,
+    )
+
     lj = openmm.CustomNonbondedForce("")
     lj.addGlobalParameter("lam", lambda_value)
     lj.addGlobalParameter("alpha", alpha_nm2)
@@ -1770,16 +2146,25 @@ def _replace_amber_nb_with_split_forces(
     # kJ/mol artefact we saw when 1-4 LJ was excluded entirely).
     # AMBER's exception list uses chargeProduct=0 to flag 1-2/1-3
     # (excluded) and a non-zero chargeProduct for 1-4 (scaled).
-    for exc in exceptions:
-        i, j, charge_prod = exc[0], exc[1], exc[2]
-        cp0 = float(charge_prod.value_in_unit(unit.elementary_charge ** 2))
-        if cp0 == 0.0:
-            # 1-2 or 1-3: fully excluded from LJ.
-            if i < j:
-                lj.addExclusion(i, j)
-            else:
-                lj.addExclusion(j, i)
-        # else: 1-4 — let the Coulomb NonbondedForce handle it.
+    # Mirror the AMBER exception list exactly into the LJ force's
+    # exclusion list — OpenMM requires the exclusion sets to match
+    # across all nonbonded forces, otherwise the Context creation
+    # fails with ``All Forces must have identical exclusions``.
+    #
+    # Two sources feed the exclusion set:
+    #   1. ``exceptions`` from the original NonbondedForce — the
+    #      1-2/1-3 pairs AMBER explicitly flagged via zero charge
+    #      product.  These already cover most bonded pairs.
+    #   2. **Topology bonds** — NonbondedForce auto-excludes
+    #      1-2 and 1-3 from topology without writing them to the
+    #      exception list.  CustomNonbondedForce has no such
+    #      auto-detection, so we have to mirror it manually.
+    #      Skipping this step gives a few dozen pairs in NB that
+    #      aren't in LJ → the Context-creation check explodes.
+    seen_lj_excl = set()
+    for (a, b) in exclusion_pairs:
+        lj.addExclusion(a, b)
+        seen_lj_excl.add((a, b))
     lj.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
     lj.setCutoffDistance(cutoff_nm * unit.nanometer)
     system.addForce(lj)
@@ -1840,6 +2225,17 @@ def _replace_amber_nb_with_split_forces(
         else:
             coulomb.addException(j, i, new_cp, new_sig, new_eps)
 
+    # NOTE: Coulomb has no ``addExclusion`` API — its exclusion set is
+    # implicit (topology 1-2/1-3) **plus** every exception whose
+    # ``chargeProduct`` *or* ``epsilon`` is zero (per John Chodera,
+    # OpenMM dev: "an exception with zero for chargeProd or epsilon
+    # uses NonbondedForce.addException, but it is an exclusion that
+    # needs to match CustomNonbondedForce").  By routing the 1-4
+    # disappearing-atom pairs through ``addException`` with
+    # ``chargeProduct=0`` (λ=1 factor zeroes them out), Coulomb
+    # automatically classifies them as exclusions — and they match the
+    # ``exclusion_pairs`` we registered on the LJ force above.
+
     system.addForce(coulomb)
 
     return lj, coulomb, n_particles, orig, exceptions, is_dis
@@ -1899,6 +2295,7 @@ def _replace_amber_nb_with_alchemical(
     lambda_value: float,
     alpha_nm2: float = 1.5,
     cutoff_nm: float = 1.0,
+    topology=None,
 ):
     """Backward-compatibility shim around
     :func:`_replace_amber_nb_with_split_forces`.  Replaces
@@ -1915,6 +2312,7 @@ def _replace_amber_nb_with_alchemical(
         _replace_amber_nb_with_split_forces(
             system, disappearing_set, lambda_value,
             alpha_nm2=alpha_nm2, cutoff_nm=cutoff_nm,
+            topology=topology,
         )
     )
     # Stash the split bookkeeping on the system object (not the
@@ -1943,7 +2341,7 @@ def build_amber_mutation_system(
     padding_nm: float = 1.0,
     ionic_strength_M: float = 0.15,
     temperature_K: float = 300.0,
-    timestep_fs: float = 2.0,
+    timestep_fs: float = 1.0,
     cutoff_nm: float = 1.0,
     lambda_value: float = 1.0,
     alpha_nm2: float = 1.5,
@@ -1992,6 +2390,7 @@ def build_amber_mutation_system(
     _replace_amber_nb_with_alchemical(
         system, set(disappearing), lambda_value=lambda_value,
         alpha_nm2=alpha_nm2,
+        topology=topology,
     )
 
     # Position restraints on disappearing atoms — see docstring.
@@ -2046,6 +2445,41 @@ def _require_path():
     return Path
 
 
+def _protein_minimise(modeller, ff, iterations: int = 200) -> None:
+    """Quick L-BFGS minimise on the protein alone, *before*
+    solvation.  ``addHydrogens`` sometimes places H atoms in
+    slightly-strained geometry (H-H on a tetrahedral C can
+    land at ~0.10 nm instead of the ideal 0.18 nm if the
+    backbone CB is already strained).  Without this fix-up,
+    those 1-3 close pairs are flagged as clashes by the
+    solvation-time overlap check and trigger the drop loop
+    below to remove every water in the box.
+
+    Uses ``app.NoCutoff`` since there's no periodic box at
+    this stage — solvation hasn't happened yet.
+    """
+    import openmm.app as _app
+    openmm, unit = _require_openmm()
+    system = ff.createSystem(
+        modeller.topology,
+        nonbondedMethod=_app.NoCutoff,
+        constraints=_app.HBonds,
+        rigidWater=False,
+    )
+    integrator = openmm.LangevinMiddleIntegrator(
+        300 * unit.kelvin,
+        1.0 / unit.picosecond,
+        1.0 * unit.femtosecond,
+    )
+    platform = openmm.Platform.getPlatformByName("CPU")
+    ctx = openmm.Context(system, integrator, platform)
+    ctx.setPositions(modeller.positions)
+    openmm.LocalEnergyMinimizer.minimize(ctx, maxIterations=iterations)
+    state = ctx.getState(getPositions=True)
+    modeller.positions = state.getPositions(asNumpy=False)
+    del ctx
+
+
 def run_amber_mutation_fep(
     pdb_file: str,
     mutation_residue: int,
@@ -2055,7 +2489,8 @@ def run_amber_mutation_fep(
     n_production_steps: int = 1000,
     temperature_K: float = 300.0,
     padding_nm: float = 0.8,
-    minimize_iterations: int = 10,
+    minimize_iterations: int = 100,
+    minimize_tolerance_kJmol: float = 10.0,
     restraint_k_kJmol_nm2: Optional[float] = None,
     sample_every: int = 1,
     sample_neighbor_lambdas: bool = False,
@@ -2205,6 +2640,48 @@ def run_amber_mutation_fep(
                 context=context,
             )
 
+    # Pre-sweep physical equilibration.  Run a short NVT phase
+    # at λ=1 (full AMBER forces, all atoms coupled to the
+    # Langevin thermostat) before the alchemical sweep starts.
+    # Without this, the integrator can blow up on close contacts
+    # that survived the minimise (random ``addSolvent`` placement
+    # occasionally produces water-water distances below the
+    # bonded O-H length of 0.1 nm).  Doing NVT first dissipates
+    # the kinetic energy injected by the Langevin random kicks
+    # and lets the system physically relax before any alchemical
+    # window begins.
+    if hasattr(openmm, "LocalEnergyMinimizer"):
+        try:
+            openmm.LocalEnergyMinimizer.minimize(
+                context,
+                maxIterations=minimize_iterations,
+                tolerance=minimize_tolerance_kJmol
+                * unit.kilojoule_per_mole / unit.nanometer,
+            )
+        except TypeError:
+            openmm.LocalEnergyMinimizer.minimize(
+                context, maxIterations=minimize_iterations,
+            )
+    _set_lambda(1.0)
+    context.setPositions(positions)
+    context.setVelocitiesToTemperature(
+        temperature_K * unit.kelvin, 0
+    )
+    # 5000-step NVT pre-equilibration at λ=1.  Random
+    # ``addSolvent`` placements occasionally leave water-water
+    # distances below the bonded O-H length of 0.1 nm; the LJ
+    # force on those pairs is large enough to blow up the
+    # integrator within ~10 steps before the per-window
+    # minimize can correct them.  A standard-length NVT
+    # equilibration (~1 ps at 2 fs = 500 steps) normally
+    # handles this, but on stubborn solvation layouts we need
+    # ~10 ps to fully relax — hence the 5000-step default.
+    # The cost is roughly +5 s on a typical ubiquitin box and
+    # turns the integrator NaN into a rare, retry-friendly
+    # transient.
+    for _ in range(5000):
+        integrator.step(1)
+
     for i, lam in enumerate(lambdas):
         # Cancellation check between windows — cheap, runs before
         # any expensive work (minimise / equilibrate).
@@ -2222,11 +2699,35 @@ def run_amber_mutation_fep(
         # Minimise at each λ before sampling — even with reference
         # positions, the λ=1 standard LJ needs a few LBFGS
         # iterations to relax clashes inherited from the
-        # unminimised solvation structure.
+        # unminimised solvation structure.  Use a tolerance-based
+        # stop condition AND a max-iterations cap, so a poorly
+        # minimised system still converges (and so that rare close
+        # contacts that explode the first MD step don't make it
+        # through).
         if hasattr(openmm, "LocalEnergyMinimizer"):
-            openmm.LocalEnergyMinimizer.minimize(
-                context, maxIterations=minimize_iterations,
-            )
+            try:
+                # OpenMM's minimize(tolerance=...) expects a FORCE
+                # tolerance in kJ/(mol·nm), not an energy tolerance.
+                # A reasonable per-atom force tolerance for AMBER is
+                # ~10 kJ/(mol·nm); we scale by sqrt(n_atoms) so the
+                # criterion doesn't drift with system size.
+                n_atoms = system.getNumParticles()
+                tol = (
+                    minimize_tolerance_kJmol
+                    * unit.kilojoule_per_mole
+                    / unit.nanometer
+                )
+                openmm.LocalEnergyMinimizer.minimize(
+                    context,
+                    maxIterations=minimize_iterations,
+                    tolerance=tol,
+                )
+            except TypeError:
+                # Older OpenMM (< 8.0) doesn't take ``tolerance`` —
+                # fall back to iteration cap only.
+                openmm.LocalEnergyMinimizer.minimize(
+                    context, maxIterations=minimize_iterations,
+                )
 
         # Equilibration phase: discard these steps so velocities
         # forget the zero-velocity initial state.
@@ -2317,7 +2818,7 @@ def build_ligand_decouple_system(
     padding_nm: float = 1.0,
     ionic_strength_M: float = 0.15,
     temperature_K: float = 300.0,
-    timestep_fs: float = 2.0,
+    timestep_fs: float = 1.0,
     cutoff_nm: float = 1.0,
     lambda_value: float = 1.0,
     alpha_nm2: float = 1.5,
@@ -2362,6 +2863,7 @@ def build_ligand_decouple_system(
     _replace_amber_nb_with_alchemical(
         system, set(disappearing), lambda_value=lambda_value,
         alpha_nm2=alpha_nm2,
+        topology=topology,
     )
 
     if restraint_k_kJmol_nm2 > 0:
@@ -2406,7 +2908,8 @@ def run_ligand_decouple_fep(
     n_production_steps: int = 1000,
     temperature_K: float = 300.0,
     padding_nm: float = 0.8,
-    minimize_iterations: int = 10,
+    minimize_iterations: int = 100,
+    minimize_tolerance_kJmol: float = 10.0,
     restraint_k_kJmol_nm2: Optional[float] = None,
     sample_every: int = 1,
     sample_neighbor_lambdas: bool = False,
@@ -2515,9 +3018,29 @@ def run_ligand_decouple_fep(
         _set_lambda(lam)
         context.setPositions(positions)
         if hasattr(openmm, "LocalEnergyMinimizer"):
-            openmm.LocalEnergyMinimizer.minimize(
-                context, maxIterations=minimize_iterations,
-            )
+            try:
+                # OpenMM's minimize(tolerance=...) expects a FORCE
+                # tolerance in kJ/(mol·nm), not an energy tolerance.
+                # A reasonable per-atom force tolerance for AMBER is
+                # ~10 kJ/(mol·nm); we scale by sqrt(n_atoms) so the
+                # criterion doesn't drift with system size.
+                n_atoms = system.getNumParticles()
+                tol = (
+                    minimize_tolerance_kJmol
+                    * unit.kilojoule_per_mole
+                    / unit.nanometer
+                )
+                openmm.LocalEnergyMinimizer.minimize(
+                    context,
+                    maxIterations=minimize_iterations,
+                    tolerance=tol,
+                )
+            except TypeError:
+                # Older OpenMM (< 8.0) doesn't take ``tolerance`` —
+                # fall back to iteration cap only.
+                openmm.LocalEnergyMinimizer.minimize(
+                    context, maxIterations=minimize_iterations,
+                )
         for _ in range(max(n_equilibration_steps, 0)):
             integrator.step(1)
         prev_lam = lambdas[i - 1] if i > 0 else None

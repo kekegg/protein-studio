@@ -16,6 +16,43 @@ import numpy as np
 from .colors import THREE_TO_ONE
 
 
+# Standard amino acid + nucleotide three-letter codes. Used by
+# ``representations._split_polymer_hetero`` (and any other consumer that
+# needs to distinguish "protein / NA polymer" from "ligand / cofactor /
+# exotic small molecule").  ``is_hetero`` from the PDB reader alone is
+# unreliable: PDB files often write custom residues (e.g. ligands,
+# MET-modified, non-standard amino acids) as ATOM records with
+# ``is_hetero=False``, which would otherwise be mis-classified as
+# polymer and trigger a cartoon rep that draws nothing.
+STANDARD_RESNAMES: frozenset[str] = frozenset({
+    # 20 standard amino acids
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS",
+    "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP",
+    "TYR", "VAL",
+    # Common histidine tautomers
+    "HID", "HIE", "HIP", "HSD", "HSE", "HSP",
+    # Modified residues that still behave as polymer backbone for FEP
+    # purposes — listed so they don't accidentally trigger hetero logic.
+    "CYX", "ASH", "GLH", "LYN",
+    # Standard nucleotides (RNA / DNA)
+    "A", "G", "C", "T", "U",
+    "DA", "DG", "DC", "DT", "DU",
+    "RA", "RG", "RC", "RU",
+})
+
+
+def is_polymer_residue(resname: str | None) -> bool:
+    """True if *resname* is a standard amino acid or nucleotide.
+
+    PDB files frequently mix true protein / NA residues with custom
+    ligands written as ``ATOM`` records (the PDB reader's ``is_hetero``
+    flag is then ``False``), so we can't rely on ``is_hetero`` alone.
+    """
+    if not resname:
+        return False
+    return resname.upper() in STANDARD_RESNAMES
+
+
 @dataclass
 class Atom:
     """A single atom record.

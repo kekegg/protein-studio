@@ -163,16 +163,40 @@ class StudioAPI:
         self,
         path: str | os.PathLike,
         name: str | None = None,
-        representation: str = "cartoon",
-        scheme: str = "secondary",
+        representation: str | None = None,
+        scheme: str | None = None,
     ) -> SceneObject:
         """Load a PDB file into the scene.
 
         >>> obj = D.load("examples/1aki.pdb")
+
+        ``representation`` and ``scheme`` are auto-picked when None:
+        proteins (any non-hetero residue) use ``cartoon`` + ``secondary``;
+        pure-hetero molecules (ligands, ions, waters) use
+        ``ball_and_stick`` + ``element`` — the cartoon spline can't draw
+        a 5-atom methane, and silently picking cartoon would leave the
+        viewport empty after a load. Pass an explicit value to override.
         """
         mol = load_pdb(path)
         if name:
             mol.name = name
+        if representation is None or scheme is None:
+            from .core.representations import _split_polymer_hetero
+            polymer_atoms, _hetero_atoms = _split_polymer_hetero(mol)
+            if polymer_atoms:
+                # Protein / nucleic acid — cartoon + secondary.
+                if representation is None:
+                    representation = "cartoon"
+                if scheme is None:
+                    scheme = "secondary"
+            else:
+                # Pure hetero — ligands / ions / waters / single atoms.
+                # Cartoon has nothing to draw; ball_and_stick + element
+                # (CPK) is the only sensible default.
+                if representation is None:
+                    representation = "ball_and_stick"
+                if scheme is None:
+                    scheme = "element"
         obj = SceneObject(
             name=name or mol.name,
             molecule=mol,

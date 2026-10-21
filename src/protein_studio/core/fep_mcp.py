@@ -278,28 +278,68 @@ def fep_run_sweep(
             sample_every=recipe["sample_every"],
             sample_neighbor_lambdas=recipe["sample_neighbor_lambdas"],
             restraint_k_kJmol_nm2=recipe["restraint_k_kJmol_nm2"],
+            minimize_iterations=recipe.get(
+                "minimize_iterations", 100
+            ),
+            minimize_tolerance_kJmol=recipe.get(
+                "minimize_tolerance_kJmol", 10.0
+            ),
+            padding_nm=0.8,  # retry will bump this on NaN
         )
 
-        if mode == "mutation":
-            if isinstance(mutation, str):
-                residue_idx = _parse_residue_id(mutation, str(p))
-            else:
-                residue_idx = int(mutation)
-            energies_by_lambda, neighbor_energies, disappearing = (
-                fep_core.run_amber_mutation_fep(
-                    str(p),
-                    mutation_residue=residue_idx,
-                    **common_kwargs,
+        # Auto-retry: ``run_amber_mutation_fep`` can blow up to
+        # NaN when OpenMM's ``addSolvent`` produces overlapping
+        # waters (occasionally 1 in 5 runs for tight padding).
+        # Each retry re-solvates with a 0.3 nm larger padding so
+        # the water placement has more room.  We give up after 3
+        # attempts — past that the user really does need an
+        # external prep tool (AmberTools tleap / GROMACS grompp).
+        max_padding_retries = 3
+        attempt = 0
+        energies_by_lambda = neighbor_energies = disappearing = None
+        last_exc = None
+        while attempt < max_padding_retries:
+            try:
+                if mode == "mutation":
+                    if isinstance(mutation, str):
+                        residue_idx = _parse_residue_id(mutation, str(p))
+                    else:
+                        residue_idx = int(mutation)
+                    (energies_by_lambda,
+                     neighbor_energies,
+                     disappearing) = fep_core.run_amber_mutation_fep(
+                        str(p),
+                        mutation_residue=residue_idx,
+                        **common_kwargs,
+                    )
+                else:
+                    (energies_by_lambda,
+                     neighbor_energies,
+                     disappearing) = fep_core.run_ligand_decouple_fep(
+                        str(p),
+                        ligand_resnames=[ligand_resname],
+                        **common_kwargs,
+                    )
+                break  # success
+            except Exception as e:
+                last_exc = e
+                err = f"{type(e).__name__}: {e}"
+                # Only retry on integrator-NaN style errors; let
+                # other errors (file not found, bad residue index,
+                # ...) surface immediately.
+                is_nan = "NaN" in err or "nan" in err.lower()
+                if not is_nan:
+                    raise
+                attempt += 1
+                if attempt >= max_padding_retries:
+                    raise
+                # Retry with 0.3 nm more padding.
+                common_kwargs["padding_nm"] = (
+                    common_kwargs["padding_nm"] + 0.3
                 )
-            )
-        else:
-            energies_by_lambda, neighbor_energies, disappearing = (
-                fep_core.run_ligand_decouple_fep(
-                    str(p),
-                    ligand_resnames=[ligand_resname],
-                    **common_kwargs,
-                )
-            )
+                # Also wipe any cached checkpoint from a previous
+                # attempt so we start fresh.
+                continue
 
         # Drive a BAR analysis on the collected energies.
         lambdas = sorted(energies_by_lambda.keys())
@@ -340,6 +380,8 @@ def fep_run_sweep(
                 str(lam): list(map(float, vals))
                 for lam, vals in energies_by_lambda.items()
             },
+            "padding_attempts": attempt + 1,
+            "final_padding_nm": common_kwargs["padding_nm"],
         }
     except Exception as e:
         return {"status": "error",
@@ -456,6 +498,13 @@ def fep_run_sweep_with_checkpoint(
             sample_every=recipe["sample_every"],
             sample_neighbor_lambdas=recipe["sample_neighbor_lambdas"],
             restraint_k_kJmol_nm2=recipe["restraint_k_kJmol_nm2"],
+            minimize_iterations=recipe.get(
+                "minimize_iterations", 100
+            ),
+            minimize_tolerance_kJmol=recipe.get(
+                "minimize_tolerance_kJmol", 10.0
+            ),
+            padding_nm=0.8,  # retry will bump on NaN
         )
 
         if mode == "mutation":
@@ -463,42 +512,63 @@ def fep_run_sweep_with_checkpoint(
                 _parse_residue_id(mutation, str(p))
                 if isinstance(mutation, str) else int(mutation)
             )
-            run_kwargs = dict(common_kwargs)
-            if remaining is not None:
-                run_kwargs["lambdas"] = remaining
-            if position_snapshot_dir is not None:
-                run_kwargs["position_snapshot_dir"] = position_snapshot_dir
-            energies, neighbors, disappearing = (
-                fep_core.run_amber_mutation_fep(
-                    str(p),
-                    mutation_residue=residue_idx,
-                    cancellation_check=cancellation_check,
-                    window_callback=_make_window_callback(
-                        checkpoint_path, pdb_path, mode, mutation,
-                        ligand_resname, recipe_name,
-                    ),
-                    **run_kwargs,
-                )
-            )
-            boresch_refs = None
         else:
-            run_kwargs = dict(common_kwargs)
-            if remaining is not None:
-                run_kwargs["lambdas"] = remaining
-            if position_snapshot_dir is not None:
-                run_kwargs["position_snapshot_dir"] = position_snapshot_dir
-            energies, neighbors, disappearing, boresch_refs = (
-                fep_core.run_ligand_decouple_fep(
-                    str(p),
-                    ligand_resnames=[ligand_resname],
-                    cancellation_check=cancellation_check,
-                    window_callback=_make_window_callback(
-                        checkpoint_path, pdb_path, mode, mutation,
-                        ligand_resname, recipe_name,
-                    ),
-                    **run_kwargs,
-                )
-            )
+            residue_idx = None
+
+        # Auto-retry on integrator NaN.  Each attempt re-solvates
+        # with 0.3 nm more padding so OpenMM's ``addSolvent`` has
+        # more room for water placement.  See notes in
+        # ``fep_run_sweep``.
+        max_padding_retries = 3
+        attempt = 0
+        energies = neighbors = disappearing = boresch_refs = None
+        last_exc: Exception | None = None
+        while attempt < max_padding_retries:
+            try:
+                run_kwargs = dict(common_kwargs)
+                if remaining is not None:
+                    run_kwargs["lambdas"] = remaining
+                if position_snapshot_dir is not None:
+                    run_kwargs["position_snapshot_dir"] = (
+                        position_snapshot_dir
+                    )
+                if mode == "mutation":
+                    (energies, neighbors,
+                     disappearing) = fep_core.run_amber_mutation_fep(
+                        str(p),
+                        mutation_residue=residue_idx,
+                        cancellation_check=cancellation_check,
+                        window_callback=_make_window_callback(
+                            checkpoint_path, pdb_path, mode, mutation,
+                            ligand_resname, recipe_name,
+                        ),
+                        **run_kwargs,
+                    )
+                    boresch_refs = None
+                else:
+                    (energies, neighbors, disappearing,
+                     boresch_refs) = fep_core.run_ligand_decouple_fep(
+                        str(p),
+                        ligand_resnames=[ligand_resname],
+                        cancellation_check=cancellation_check,
+                        window_callback=_make_window_callback(
+                            checkpoint_path, pdb_path, mode, mutation,
+                            ligand_resname, recipe_name,
+                        ),
+                        **run_kwargs,
+                    )
+                break
+            except Exception as e:
+                last_exc = e
+                err = f"{type(e).__name__}: {e}"
+                is_nan = "NaN" in err or "nan" in err.lower()
+                if not is_nan:
+                    raise
+                attempt += 1
+                if attempt >= max_padding_retries:
+                    raise
+                common_kwargs["padding_nm"] += 0.3
+                continue
 
         # Merge with existing partial energies (resume case).
         if resume:
