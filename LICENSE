@@ -1,0 +1,437 @@
+PROTEIN STUDIO — ACADEMIC RESEARCH USE LICENSE
+Version 1.0, 21 October 2026
+SPDX-License-Identifier: ProteinStudio-Academic-Research-Use-Only-1.0
+
+Copyright (c) 2026 Zhengwei Xie (谢正伟) and the Protein Studio contributors.
+All rights reserved.
+
+================================================================================
+NOTICE
+================================================================================
+
+This is a custom, proprietary academic-use license. It is NOT an OSI-approved
+open-source license, and it is deliberately more restrictive than MIT, BSD, or
+Apache. If you need different terms — including any commercial use — you must
+obtain prior written permission from the Licensor. See Section 5.
+
+--------------------------------------------------------------------------------
+SUMMARY (the legally operative terms are Sections 1–13)
+--------------------------------------------------------------------------------
+
+  YES, you may, free of charge:
+    • use, study, modify, and run this software for academic research,
+      education, and non-commercial scientific work;
+    • modify the source and redistribute your modified versions, provided you
+      keep this license, keep the third-party notices intact, and mark your
+      changes (Section 8);
+    • publish figures, images, and other renderings you produce with it in
+      academic papers, theses, talks, and posters;
+    • use it in a classroom, a lab, or a not-for-profit research group.
+
+  NO, you may not, without prior written permission (Section 5):
+    • use the software, in original or modified form, for any commercial
+      purpose — including inside a commercial product or service, in a
+      paid-for service, or as part of a workflow whose primary purpose is
+      commercial;
+    • sell, sublicense, or rent the software;
+    • imply endorsement by the Licensor or by any contributor.
+
+  ALWAYS:
+    • keep the copyright notice and this license with every copy;
+    • keep the third-party notices (Section 6) — several files under
+      src/protein_studio/core/ are derived from 3Dmol.js (BSD-3-Clause) and
+      must carry its notice;
+    • cite the project (Section 7);
+    • accept that the software is provided "AS IS", with no warranty
+      (Sections 9–10);
+    • remember that it is a research tool, not a medical device (Section 11).
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+  1.  Definitions
+  2.  Grant of Academic Use Rights
+  3.  Restrictions
+  4.  Permitted Academic Outputs
+  5.  Commercial Use — Prior Written Permission Required
+  6.  Third-Party Components
+  7.  Citation and Attribution
+  8.  Modifications, Contributions, and Redistribution
+  9.  Disclaimer of Warranty
+  10. Limitation of Liability
+  11. Intended Use and Regulatory Status
+  12. Termination
+  13. General Provisions
+      13.1 Governing law
+      13.2 Severability
+      13.3 Entire agreement
+      13.4 Notices and commercial permission requests
+      13.5 Amendment
+      13.6 No endorsement
+      13.7 Survival
+
+================================================================================
+1. DEFINITIONS
+================================================================================
+
+1.1  "Software" means the Protein Studio application and its source code as
+     distributed by the Licensor, including the Python package under
+     src/protein_studio/, the test suite, the example data, the build and
+     documentation tooling, and any documentation shipped with it.
+
+1.2  "Licensor" means Zhengwei Xie (谢正伟), the copyright holder of the
+     Software, or any successor entity he designates in writing.
+
+1.3  "You" means the individual or legal entity exercising the permissions
+     granted by this License.
+
+1.4  "Academic Use" means use for scientific research, education, scholarly
+     communication, or other not-for-profit scholarly activity, in each case
+     without seeking or deriving commercial advantage from the Software
+     itself.
+
+1.5  "Commercial Use" means any use of the Software — in original or modified
+     form, in source or binary form, alone or combined with other software —
+     that is undertaken for, or in the course of, a commercial activity or
+     business. Commercial Use includes, without limitation: embedding the
+     Software in a product or service offered for money or to a paying
+     customer; using it as part of a paid service, a contract research
+     engagement, or a consultancy deliverable; using it to make decisions
+     whose primary purpose is commercial gain; and distributing the Software
+     as part of a commercially offered offering.
+
+1.6  "Output" means any image, rendering, measurement, structure, trajectory
+     annotation, distance, score, or other result produced by running the
+     Software.
+
+1.7  "Derivative Work" means any work that is based on, or that incorporates
+     code, structure, design, or other elements of, the Software.
+
+1.8  "Third-Party Components" means the third-party libraries and other
+     materials listed in Section 6.
+
+================================================================================
+2. GRANT OF ACADEMIC USE RIGHTS
+================================================================================
+
+2.1  Subject to the terms of this License, the Licensor grants You a
+     worldwide, royalty-free, non-exclusive, non-transferable license to use,
+     reproduce, modify, and prepare Derivative Works of the Software, and to
+     distribute such Derivative Works, solely for Academic Use.
+
+2.2  The rights granted in Section 2.1 include the right to:
+
+     (a)  install, run, and evaluate the Software for research and teaching;
+
+     (b)  inspect, study, and modify the source code;
+
+     (c)  create and distribute Derivative Works for Academic Use, subject to
+          Section 8;
+
+     (d)  communicate, teach, and demonstrate the Software to others;
+
+     (e)  reproduce academic Outputs and publish them as described in
+          Section 4.
+
+2.3  These rights are granted for the term of this License and are
+     conditioned on Your continued compliance with Sections 3, 5, 6, 7, and 8.
+
+2.4  All rights not expressly granted in this License are reserved by the
+     Licensor. In particular, no implied license, no implied waiver, and no
+     course of dealing or course of performance shall be construed as
+     granting any right not stated here.
+
+================================================================================
+3. RESTRICTIONS
+================================================================================
+
+3.1  Commercial Use of the Software requires prior written permission under
+     Section 5. Until such permission is granted in writing and signed by the
+     Licensor, Commercial Use is prohibited.
+
+3.2  You may not:
+
+     (a)  sell, rent, lease, sublicense, sell access to, or otherwise
+          monetize the Software or any Derivative Work of it;
+
+     (b)  use the Software or any Derivative Work of it in the course of
+          Commercial Use, including as a component of a commercial product or
+          service;
+
+     (c)  remove, obscure, or alter any copyright notice, license notice,
+          attribution, or third-party notice contained in the Software;
+
+     (d)  use the name, trade name, logo, or names of the Licensor or any
+          contributor to endorse, promote, or imply a relationship with Your
+          product or service;
+
+     (e)  represent that the Software or any Derivative Work has been
+          certified or endorsed by the Licensor;
+
+     (f)  use the Software in a way that violates applicable law, including
+          export-control and sanctions law.
+
+3.3  The restrictions in Section 3.2 apply equally to a Derivative Work. A
+     Derivative Work inherits this License unless the Licensor agrees in
+     writing to different terms.
+
+================================================================================
+4. PERMITTED ACADEMIC OUTPUTS
+================================================================================
+
+4.1  Outputs produced by running the Software for Academic Use may be used,
+     reproduced, and published without restriction or additional permission,
+     including in academic papers, preprints, theses, dissertations, conference
+     talks and posters, textbooks, course materials, and open-access
+     repositories.
+
+4.2  Academic Outputs may be licensed by their authors under whatever terms
+     the authors choose, including commercial terms, provided that the
+     underlying Software is not redistributed as part of that license.
+
+4.3  If an Output is to be used for Commercial Use, or if it is to be
+     incorporated into a product or service offered commercially, you must
+     obtain prior written permission under Section 5. This Section does not
+     restrict academic use of Outputs; it addresses the commercial use of
+     Outputs.
+
+================================================================================
+5. COMMERCIAL USE — PRIOR WRITTEN PERMISSION REQUIRED
+================================================================================
+
+5.1  Commercial Use of the Software requires the prior written permission of
+     the Licensor. That permission must be obtained before the Commercial Use
+     begins.
+
+5.2  A request for commercial permission must include, at a minimum:
+
+     (a)  the name and contact details of the requesting individual or legal
+          entity;
+
+     (b)  a description of the intended Commercial Use, including the product,
+          service, or workflow in which the Software would be used and whether
+          the Software would be distributed to third parties;
+
+     (c)  the jurisdictions in which the Commercial Use would take place;
+
+     (d)  the term of the requested permission and any volume, seat, or
+          revenue limits relevant to it.
+
+5.3  The Licensor may grant, refuse, or condition commercial permission at the
+     Licensor's sole discretion, and may charge a license fee. Any permission
+     granted is effective only when it is set out in a written instrument
+     signed by the Licensor.
+
+5.4  Silence, delay in responding, continued correspondence without a
+     signature, or the act of downloading or running the Software does not
+     constitute permission for Commercial Use, and no implied or
+     course-of-dealing permission arises from the Licensor's conduct.
+
+================================================================================
+6. THIRD-PARTY COMPONENTS
+================================================================================
+
+6.1  The Software depends on, or incorporates algorithms derived from, the
+     Third-Party Components listed below. Each remains subject to its own
+     license, and each license governs the use of that component. Nothing in
+     this License grants any right in a Third-Party Component, or imposes any
+     additional restriction on one.
+
+6.2  Principal Third-Party Components:
+
+     PySide6 / Qt for Python ......... LGPL-3.0 (with the Qt Commercial
+                                       License as an alternative)
+     PyVista, VTK .................... MIT / BSD-style (see each project's
+                                       own license)
+     NumPy, SciPy .................... BSD-3-Clause
+     scikit-image ..................... BSD-3-Clause
+     Biopython / biotite .............. BSD-3-Clause / BSD-2-Clause
+     MDAnalysis ...................... LGPL-2.1
+     3Dmol.js ......................... BSD-3-Clause
+     Example structures in examples/ .. RCSB PDB, released under CC0
+
+6.3  Portions of the following files are derived from 3Dmol.js and are
+     distributed under the 3Dmol.js BSD-3-Clause license:
+
+     src/protein_studio/core/secondary.py
+     src/protein_studio/core/charges.py
+     src/protein_studio/core/surface.py
+     src/protein_studio/core/representations.py
+
+     Those files carry the full 3Dmol.js copyright notice and license text
+     inline, as required by clause 1 of the BSD-3-Clause license:
+
+         3Dmol.js
+         Copyright (c) 2014, University of Pittsburgh and contributors
+         All rights reserved.
+
+     You must not remove that notice from those files, or from any copy or
+     Derivative Work of them.
+
+6.4  The full text of the Third-Party licenses, as distributed with the
+     corresponding upstream projects, is incorporated here by reference. Where
+     a Third-Party Component's license conflicts with this License, the
+     Third-Party Component's license prevails as to that component, and
+     nothing in this License shall be construed as narrowing rights that the
+     Third-Party license grants.
+
+6.5  This Section survives any redistribution of the Software or any
+     Derivative Work.
+
+================================================================================
+7. CITATION AND ATTRIBUTION
+================================================================================
+
+7.1  If the Software or any Derivative Work of it is used in Academic Use,
+     you should cite the project and reference its repository, for example:
+
+         Protein Studio: A Blender-like molecular viewer with an embedded
+         Python scripting console. Zhengwei Xie.
+         https://github.com/kekegg/protein-studio
+
+7.2  The Licensor may publish an associated paper, preprint, or software
+     archive in the future. If such a work exists at the time of your use and
+     the Licensor has requested citation in the repository README, please cite
+     that work in addition to Section 7.1.
+
+7.3  Citation is requested, not a condition of the license grant for Academic
+     Use. Failure to cite does not create a breach of Sections 2 or 3.
+
+================================================================================
+8. MODIFICATIONS, CONTRIBUTIONS, AND REDISTRIBUTION
+================================================================================
+
+8.1  You may modify the Software and redistribute your modified versions for
+     Academic Use, provided that you:
+
+     (a)  keep this License in full, unmodified, with every copy;
+
+     (b)  keep all third-party notices intact, including the 3Dmol.js notice
+          in the files listed in Section 6.3;
+
+     (c)  clearly mark any file you changed and the nature of the change;
+
+     (d)  do not use the Licensor's name or the names of contributors to
+          endorse or promote your modified version, other than to state
+          truthfully that it is derived from the Software;
+
+     (e)  make the source of your modified version available under this
+          License to anyone to whom you distribute it.
+
+8.2  Contributions to the Software are welcome. If you submit a contribution
+     to the Licensor, you grant the Licensor a perpetual, worldwide,
+     non-exclusive, royalty-free license to use, modify, and distribute that
+     contribution as part of the Software, under the terms of this License.
+
+8.3  The Licensor may relicense the Software, or any part of it, in the
+     future. This Section does not restrict the Licensor's own rights in the
+     Software.
+
+================================================================================
+9. DISCLAIMER OF WARRANTY
+================================================================================
+
+9.1  THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF
+     ANY KIND, EITHER EXPRESS, IMPLIED, OR STATUTORY, INCLUDING WITHOUT
+     LIMITATION THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+     PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+9.2  The Licensor does not warrant that the Software will be error-free or
+     uninterrupted, that it will produce scientifically valid results, or that
+     it is suitable for any particular purpose, including any regulated
+     activity. Structures, representations, colours, surfaces, and distances
+     produced by the Software must be independently validated by the user
+     before being relied upon.
+
+9.3  The Licensor is not responsible for the accuracy of any structure file,
+     docking pose, trajectory, or third-party data loaded into the Software,
+     nor for any decision made on the basis of its Output.
+
+================================================================================
+10. LIMITATION OF LIABILITY
+================================================================================
+
+10.1 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+     LICENSOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+     EXEMPLARY, OR CONSEQUENTIAL DAMAGES, OR FOR ANY LOSS OF PROFITS, REVENUE,
+     DATA, GOODWILL, OR BUSINESS INTERRUPTION, HOWEVER CAUSED AND UNDER ANY
+     THEORY OF LIABILITY — WHETHER IN CONTRACT, STRICT LIABILITY, TORT
+     (INCLUDING NEGLIGENCE OR OTHERWISE), OR OTHERWISE — ARISING OUT OF OR
+     IN CONNECTION WITH THE SOFTWARE OR ITS USE OR OTHER DEALINGS IN THE
+     SOFTWARE, EVEN IF THE LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF
+     SUCH DAMAGES.
+
+10.2 Some jurisdictions do not allow the exclusion or limitation of implied
+     warranties or liability for certain kinds of loss, so parts of Sections
+     9 and 10 may not apply to you. In that case, the liability of the
+     Licensor is limited to the minimum permitted by law.
+
+================================================================================
+11. INTENDED USE AND REGULATORY STATUS
+================================================================================
+
+11.1 The Software is a research and visualization tool. It is NOT a medical
+     device, and it is NOT approved, cleared, or certified for any diagnostic,
+     therapeutic, or regulatory purpose.
+
+11.2 The Software must not be used as the sole basis for clinical decisions,
+     patient management, or the safety assessment of any substance, and its
+     Output must not be presented as a clinical or regulatory conclusion
+     without independent expert review.
+
+================================================================================
+12. TERMINATION
+================================================================================
+
+12.1 This License terminates automatically if You breach any of its terms. On
+     termination, You must cease all use of the Software and destroy every
+     copy in Your possession or control, including any Derivative Work, and
+     remove it from any distribution channel.
+
+12.2 Termination does not affect the rights of third parties under
+     Section 6, nor the obligations in Sections 7, 9, 10, 11, and 13.7, which
+     survive termination.
+
+================================================================================
+13. GENERAL PROVISIONS
+================================================================================
+
+13.1 GOVERNING LAW. This License is governed by the laws of the People's
+     Republic of China, without regard to its conflict-of-law provisions.
+
+13.2 SEVERABILITY. If any provision of this License is held unenforceable, that
+     provision shall be reformed to the minimum extent necessary to make it
+     enforceable, and the remaining provisions remain in full force.
+
+13.3 ENTIRE AGREEMENT. This License constitutes the entire agreement between
+     the parties with respect to the Software and supersedes all prior or
+     contemporaneous understandings on that subject. A separate commercial
+     permission agreement under Section 5, if executed, supersedes this
+     License as to the Commercial Use it covers.
+
+13.4 NOTICES AND COMMERCIAL PERMISSION REQUESTS. Notices under this License
+     and requests for commercial permission shall be sent to the Licensor at
+     the contact address given in Section 13.8.
+
+13.5 AMENDMENT. The Licensor may amend this License by publishing a revised
+     version in the repository from which the Software is distributed. The
+     amended License applies to use occurring after its publication; it does
+     not retroactively revoke permissions already granted for Academic Use.
+
+13.6 NO ENDORSEMENT. Neither the name of the Licensor nor the names of any
+     contributors may be used to endorse or promote products derived from the
+     Software without specific prior written permission.
+
+13.7 SURVIVAL. Sections 6, 7, 9, 10, 11, and 13 survive termination or
+     expiration of this License.
+
+13.8 CONTACT.
+
+     Licensor:     Zhengwei Xie (谢正伟) / Protein Studio contributors
+     Email:        xiezhengwei@hsc.pku.edu.cn
+     Repository:   https://github.com/kekegg/protein-studio
+
+================================================================================
+END OF LICENSE
+================================================================================

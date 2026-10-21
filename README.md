@@ -40,6 +40,18 @@ lines of code and the rendering pipeline is a single PyVista plotter.
 - **Headless mode** — render a single frame to PNG without launching
   the GUI.
 - **Object-level transforms** — per-object position / rotation / scale.
+- **Secondary-structure inference** — DSSP-like classification from backbone
+  N···O hydrogen bonds, so `secondary` colouring works even on PDB files
+  that carry no `HELIX`/`SHEET` records.
+- **Free-energy perturbation (FEP)** — OpenMM-backed λ-sweep with BAR
+  estimation, four shipped recipes (`quick_test`, `production_bar`,
+  `benchmark_mutation`, `benchmark_ligand`), checkpoint/resume, and an
+  `Analyze` tab with per-window plots.
+- **MCP server** — drive the viewer from an AI agent over stdio or HTTP:
+  5 scene tools (`load_pdb`, `load_docking`, `load_alphafold`,
+  `set_representation`, `set_scheme`) plus 12 `fep_*` tools for building
+  systems, running sweeps, resuming from checkpoints and comparing against
+  reference ΔG values.
 
 ## Quick start
 
@@ -56,6 +68,23 @@ protein-studio                              # empty scene
 protein-studio examples/1ubq.pdb            # auto-load ubiquitin
 protein-studio examples/1ubq.pdb --headless # render one frame and quit
 ```
+
+### Optional feature sets
+
+The core install is enough for loading, colouring, representations, surfaces
+and the embedded console. The heavier features live behind extras so that a
+plain `pip install -e .` stays light:
+
+```bash
+pip install -e ".[trajectory]"   # MD trajectories (MDAnalysis)
+pip install -e ".[mcp]"          # MCP server for agent control (mcp, uvicorn)
+pip install -e ".[fep]"          # free-energy perturbation (OpenMM)
+pip install -e ".[all]"          # everything above
+pip install -e ".[dev]"          # pytest + coverage
+```
+
+Each optional dependency is imported lazily and raises a clear `ImportError`
+with installation instructions if it is missing.
 
 ## Screenshots
 
@@ -187,23 +216,40 @@ and EquiScore-style directories (with optional `scores.txt`).
 src/protein_studio/
 ├── app.py                    # CLI / QApplication entry point
 ├── api.py                    # StudioAPI exposed to the console as `D`
+├── mcp_server.py             # MCP server (stdio + HTTP) for agent control
+├── mcp_qt_server.py          # MCP server running on the GUI thread
+├── mcp_bridge.py             # MCP ↔ GUI-thread dispatch bridge
+├── resources.py              # resource resolution (icons, data files)
 ├── core/
 │   ├── molecule.py           # Atom / Residue / Chain / Molecule dataclasses
 │   ├── io.py                 # PDB parser/writer
 │   ├── colors.py             # CPK / residue / SS / chain / AlphaFold palettes
+│   ├── secondary.py          # DSSP-like SS inference from backbone H-bonds
 │   ├── charges.py            # Gasteiger partial charges + ESP sampling
 │   ├── hbonds.py             # H-bond detection + distance measurement
+│   ├── surface.py            # EDTSurf-style SES / SAS / VDW surface
+│   ├── marching_cubes.py     # marching-cubes wrapper (scikit-image)
 │   ├── trajectory.py         # MDAnalysis trajectory wrapper
 │   ├── alphafold.py          # pLDDT extraction + summary
 │   ├── docking.py            # Vina PDBQT + EquiScore pose parsing
 │   ├── representations.py    # PyVista mesh builders (incl. esp_surface, hbonds)
-│   └── scene.py              # Scene + SceneObject + change events
+│   ├── scene.py              # Scene + SceneObject + change events
+│   ├── fep.py                # OpenMM FEP engine (λ-sweep, BAR, checkpoints)
+│   ├── fep_recipes.py        # named FEP parameter presets
+│   ├── fep_reference.py      # reference ΔG library + comparison
+│   ├── fep_checkpoint.py     # checkpoint save / resume
+│   └── fep_mcp.py            # FEP operations exposed as MCP tools
 └── ui/
     ├── main_window.py        # Blender-like layout
     ├── viewport.py           # PyVista interactor wrapper
     ├── outliner.py           # Left-side scene tree
     ├── properties.py         # Right-side property panel
-    └── console.py            # Embedded Python REPL
+    ├── console.py            # Embedded Python REPL
+    ├── editor.py             # PDB editing
+    ├── fep_panel.py          # FEP Setup / Run / Analyze tabs
+    ├── fep_analyze.py        # FEP result analysis
+    ├── fep_plots.py          # FEP plotting widgets
+    └── mcp_controller.py     # MCP control panel
 ```
 
 The whole rendering pipeline is one PyVista plotter; every
@@ -218,6 +264,71 @@ density maps, …) trivial — drop a new function in
 pytest tests/
 ```
 
+## Third-party components
+
+The following upstream projects are used as dependencies; each remains under
+its own license and is **not** covered by this project's license.
+
+| Component | License |
+| --- | --- |
+| PySide6 / Qt for Python | LGPL-3.0 (or Qt Commercial) |
+| PyVista, VTK | MIT / BSD-style |
+| NumPy, SciPy | BSD-3-Clause |
+| scikit-image | BSD-3-Clause |
+| MDAnalysis | LGPL-2.1 |
+| 3Dmol.js | BSD-3-Clause |
+| Example structures in `examples/` | RCSB PDB, CC0 |
+
+Parts of `core/secondary.py`, `core/charges.py`, `core/surface.py` and
+`core/representations.py` are **ported from 3Dmol.js**
+(© 2014 University of Pittsburgh and contributors, BSD-3-Clause). Those files
+carry the full upstream copyright notice inline, as the BSD-3-Clause license
+requires — please do not remove it.
+
+3Dmol.js itself is **not** vendored in this repository and is **not** a runtime
+dependency; it was only the upstream reference while the algorithms were being
+ported. Nothing you install needs it.
+
+## Citation
+
+If you use Protein Studio in academic work, please cite the project:
+
+```bibtex
+@software{protein-studio,
+  author  = {Xie, Zhengwei},
+  title   = {Protein Studio: A Blender-like molecular viewer with an embedded
+             Python scripting console},
+  version = {0.3.0},
+  url     = {https://github.com/kekegg/protein-studio}
+}
+```
+
+If an associated paper is published later it will be listed in this section —
+please cite that work as well when it is available.
+
 ## License
 
-MIT. PDB files in `examples/` come from the RCSB PDB (CC0).
+**Academic Research Use License 1.0** — free for academic research, education
+and non-commercial scholarly work; **commercial use requires prior written
+permission**.
+
+- English (authoritative): [`LICENSE`](LICENSE)
+- 中文对照译本（仅供参考，冲突以英文版为准）: [`LICENSE.zh-CN.md`](LICENSE.zh-CN.md)
+
+In short: you may use, study, modify and redistribute it for academic work,
+and publish the figures you produce. You may **not** use it for commercial
+purposes, sell it, or use it inside a commercial product without written
+permission from the author. Redistribution must keep the license, keep the
+third-party notices, and mark your changes.
+
+> ⚠️ Protein Studio is a **research and visualization tool**. It is not a
+> medical device and is not approved for any diagnostic, therapeutic or
+> regulatory purpose. Structures, representations, surfaces, distances and
+> energies it produces must be independently validated before you rely on
+> them.
+
+## Disclaimer
+
+Provided "AS IS", without warranty of any kind. See Sections 9–11 of the
+license for the full warranty disclaimer, limitation of liability and
+regulatory status.
