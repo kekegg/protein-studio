@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: >-
+  Protein Studio is free for academic research, education and non-commercial
+  scholarly use. Commercial use requires prior written permission (see
+  LICENSE). If you use the software, or figures you produce with it, please
+  cite the project below.
+title: "Protein Studio: A Blender-like molecular viewer with an embedded Python scripting console"
+type: software
+version: 0.3.0
+date-released: "2026-10-21"
+authors:
+  - family-names: Xie
+    given-names: Zhengwei
+    orcid: "https://orcid.org/0000-0001-9572-878X"
+    affiliation: "Peking University International Cancer Institute, Health Science Center, Peking University, Beijing, China"
+repository-code: "https://github.com/kekegg/protein-studio"
+url: "https://github.com/kekegg/protein-studio"
+abstract: >-
+  Protein Studio is a desktop molecular visualisation and editing application
+  with an embedded Python scripting console, built on PySide6, PyVista and
+  VTK. It loads PDB structures and renders seven representations (cartoon,
+  ribbon, ball-and-stick, surface, points, electrostatic surface and hydrogen
+  bonds) under seven colour schemes, including an AlphaFold pLDDT palette.
+  Secondary structure is inferred from backbone hydrogen bonds, so
+  structure-aware colouring works on PDB files that carry no HELIX or SHEET
+  records. It reads MD trajectories, docking poses and AlphaFold predictions,
+  runs OpenMM free-energy perturbation sweeps with checkpoint/resume, and
+  exposes a Model Context Protocol server so that an AI agent can drive the
+  viewer over stdio or HTTP.
+keywords:
+  - molecular visualization
+  - protein structure
+  - PDB
+  - PySide6
+  - PyVista
+  - free energy perturbation
+  - Model Context Protocol
+  - AlphaFold pLDDT
