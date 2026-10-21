@@ -4,7 +4,7 @@ A Blender-like molecular visualization and editing desktop application
 with an embedded Python scripting console — built on **PySide6 + PyVista
 + VTK**.
 
-![Ubiquitin cartoon, secondary-structure colors](docs/ubiquitin_cartoon_secondary.png)
+![Ubiquitin ribbon, secondary-structure colours](docs/ubiquitin_ribbon_secondary.png)
 
 ![Full GUI on macOS](docs/fullscreen.png)
 
@@ -88,9 +88,9 @@ with installation instructions if it is missing.
 
 ## Screenshots
 
-| Cartoon (secondary-structure colours) | Hemoglobin (cartoon, chain colours) | Ball-and-stick (element colours) |
+| Ribbon (secondary-structure colours) | Haemoglobin (ribbon, chain colours) | Ball-and-stick (CPK element colours) |
 | --- | --- | --- |
-| ![](docs/ubiquitin_cartoon_secondary.png) | ![](docs/hemoglobin_cartoon_chain.png) | ![](docs/ubiquitin_balls_element.png) |
+| ![](docs/ubiquitin_ribbon_secondary.png) | ![](docs/hemoglobin_ribbon_chain.png) | ![](docs/ubiquitin_balls_element.png) |
 
 | Hydrogen bonds (yellow) | AlphaFold pLDDT colouring | ESP surface (red-white-blue) |
 | --- | --- | --- |
@@ -99,6 +99,23 @@ with installation instructions if it is missing.
 | Docking poses (rank-coloured) |
 | --- |
 | ![](docs/docking_poses.png) |
+
+### Regenerating the figures
+
+Every figure above is rendered by the current representation code, so the
+documentation cannot drift away from the implementation:
+
+```bash
+python scripts/render_readme_images.py            # all figures
+python scripts/render_readme_images.py ubiquitin  # only matching names
+python scripts/render_readme_images.py --list     # show the table
+```
+
+The script uses the same three-point light rig as the running application and
+renders polymer-only structures without HETATM records (waters, ligands,
+ions), so the figures stay free of clutter. The AlphaFold figure is a real
+prediction from the AlphaFold Protein Structure Database
+(`examples/AF-P0DP23-F1.pdb` — calmodulin-1, UniProt P0DP23).
 
 The application opens with three panels around a 3D viewport:
 
@@ -277,7 +294,7 @@ its own license and is **not** covered by this project's license.
 | scikit-image | BSD-3-Clause |
 | MDAnalysis | LGPL-2.1 |
 | 3Dmol.js | BSD-3-Clause |
-| Example structures in `examples/` | RCSB PDB, CC0 |
+| Example structures in `examples/` | RCSB PDB (CC0); AlphaFold DB prediction (CC0) |
 
 Parts of `core/secondary.py`, `core/charges.py`, `core/surface.py` and
 `core/representations.py` are **ported from 3Dmol.js**
